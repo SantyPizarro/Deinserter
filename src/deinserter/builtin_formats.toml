@@ -1,0 +1,454 @@
+[[formats]]
+type_name = "unity"
+extensions = [".unity"]
+category = "levels"
+role = "unity_scene_yaml"
+decompile_value = "high"
+text = true
+
+[[formats]]
+type_name = "prefab"
+extensions = [".prefab"]
+category = "data"
+role = "unity_prefab_yaml"
+decompile_value = "high"
+text = true
+
+[[formats]]
+type_name = "uasset"
+extensions = [".uasset"]
+category = "data"
+role = "unreal_asset_package"
+decompile_value = "medium"
+
+[[formats]]
+type_name = "umap"
+extensions = [".umap"]
+category = "levels"
+role = "unreal_map_package"
+decompile_value = "high"
+
+[[formats]]
+type_name = "uexp"
+extensions = [".uexp"]
+category = "data"
+role = "unreal_export_payload"
+decompile_value = "medium"
+
+[[formats]]
+type_name = "ubulk"
+extensions = [".ubulk"]
+category = "data"
+role = "unreal_bulk_data"
+decompile_value = "medium"
+
+[[formats]]
+type_name = "godot"
+extensions = [".godot"]
+category = "data"
+role = "godot_project_config"
+decompile_value = "high"
+text = true
+
+[[formats]]
+type_name = "tscn"
+extensions = [".tscn"]
+category = "levels"
+role = "godot_text_scene"
+decompile_value = "high"
+text = true
+
+[[formats]]
+type_name = "fbx"
+extensions = [".fbx"]
+category = "models"
+role = "model_or_animation_asset"
+decompile_value = "low"
+text = true
+
+[[formats]]
+type_name = "obj"
+extensions = [".obj"]
+category = "models"
+role = "wavefront_model_text"
+decompile_value = "low"
+text = true
+
+[[formats]]
+type_name = "gltf"
+extensions = [".gltf"]
+category = "models"
+role = "gltf_model_json"
+decompile_value = "low"
+text = true
+
+[[formats]]
+type_name = "glb"
+extensions = [".glb"]
+category = "models"
+role = "binary_gltf_model"
+decompile_value = "low"
+
+[[formats]]
+type_name = "dds"
+extensions = [".dds"]
+category = "textures"
+role = "texture_asset"
+decompile_value = "low"
+
+[[formats]]
+type_name = "tga"
+extensions = [".tga"]
+category = "textures"
+role = "texture_asset"
+decompile_value = "low"
+
+[[formats]]
+type_name = "ktx"
+extensions = [".ktx"]
+category = "textures"
+role = "texture_asset"
+decompile_value = "low"
+
+[[formats]]
+type_name = "png"
+extensions = [".png"]
+category = "textures"
+role = "image_asset"
+decompile_value = "low"
+
+[[formats]]
+type_name = "jpg"
+extensions = [".jpg", ".jpeg"]
+category = "textures"
+role = "image_asset"
+decompile_value = "low"
+
+[[formats]]
+type_name = "wav"
+extensions = [".wav"]
+category = "audio"
+role = "audio_asset"
+decompile_value = "low"
+
+[[formats]]
+type_name = "ogg"
+extensions = [".ogg"]
+category = "audio"
+role = "audio_asset"
+decompile_value = "low"
+
+[[formats]]
+type_name = "fsb"
+extensions = [".fsb"]
+category = "audio"
+role = "fmod_fsb5_audio_bank"
+decompile_value = "low"
+
+[[formats]]
+type_name = "bank"
+extensions = [".bank"]
+category = "audio"
+role = "audio_bank"
+decompile_value = "low"
+
+[[formats]]
+type_name = "cs"
+extensions = [".cs"]
+category = "scripts"
+role = "source_or_script_text"
+decompile_value = "high"
+text = true
+
+[[formats]]
+type_name = "cpp"
+extensions = [".cpp", ".cc", ".cxx", ".c"]
+category = "scripts"
+role = "source_or_script_text"
+decompile_value = "high"
+text = true
+
+[[formats]]
+type_name = "h"
+extensions = [".h", ".hpp", ".hh", ".hxx"]
+category = "scripts"
+role = "source_or_script_text"
+decompile_value = "high"
+text = true
+
+[[formats]]
+type_name = "gd"
+extensions = [".gd"]
+category = "scripts"
+role = "godot_script_text"
+decompile_value = "high"
+text = true
+
+[[formats]]
+type_name = "lua"
+extensions = [".lua"]
+category = "scripts"
+role = "source_or_script_text"
+decompile_value = "high"
+text = true
+
+[[formats]]
+type_name = "json"
+extensions = [".json"]
+category = "data"
+role = "structured_data_text"
+decompile_value = "high"
+text = true
+
+[[formats]]
+type_name = "xml"
+extensions = [".xml"]
+category = "data"
+role = "structured_data_text"
+decompile_value = "high"
+text = true
+
+[[formats]]
+type_name = "yaml"
+extensions = [".yaml", ".yml"]
+category = "data"
+role = "structured_data_text"
+decompile_value = "high"
+text = true
+
+[[formats]]
+type_name = "ini"
+extensions = [".ini", ".cfg"]
+category = "data"
+role = "config_text"
+decompile_value = "high"
+text = true
+
+[[formats]]
+type_name = "sav"
+extensions = [".sav"]
+category = "data"
+role = "save_data"
+decompile_value = "medium"
+
+[[formats]]
+type_name = "dat"
+extensions = [".dat", ".data"]
+category = "data"
+role = "generic_game_data"
+decompile_value = "medium"
+
+[[formats]]
+type_name = "pak"
+extensions = [".pak"]
+category = "containers"
+role = "archive_or_asset_container"
+decompile_value = "high"
+
+[[formats]]
+type_name = "vpk"
+extensions = [".vpk"]
+category = "containers"
+role = "archive_or_asset_container"
+decompile_value = "high"
+
+[[formats]]
+type_name = "rpf"
+extensions = [".rpf"]
+category = "containers"
+role = "archive_or_asset_container"
+decompile_value = "high"
+
+[[formats]]
+type_name = "utoc"
+extensions = [".utoc"]
+category = "containers"
+role = "unreal_io_store_table"
+decompile_value = "high"
+
+[[formats]]
+type_name = "ucas"
+extensions = [".ucas"]
+category = "containers"
+role = "unreal_io_store_payload"
+decompile_value = "high"
+
+[[formats]]
+type_name = "bundle"
+extensions = [".bundle"]
+category = "containers"
+role = "unity_asset_bundle"
+decompile_value = "high"
+
+[[formats]]
+type_name = "assets"
+extensions = [".assets"]
+category = "containers"
+role = "unity_assets_container"
+decompile_value = "high"
+
+[[formats]]
+type_name = "resource"
+extensions = [".resource", ".ress"]
+category = "containers"
+role = "engine_resource_container"
+decompile_value = "high"
+
+[[formats]]
+type_name = "lvl"
+extensions = [".lvl"]
+category = "levels"
+role = "map_or_level_data"
+decompile_value = "high"
+
+[[formats]]
+type_name = "hlsl"
+extensions = [".hlsl"]
+category = "shaders"
+role = "shader_source_text"
+decompile_value = "high"
+text = true
+
+[[formats]]
+type_name = "glsl"
+extensions = [".glsl", ".frag", ".vert"]
+category = "shaders"
+role = "shader_source_text"
+decompile_value = "high"
+text = true
+
+[[formats]]
+type_name = "shadergraph"
+extensions = [".shadergraph"]
+category = "shaders"
+role = "shader_graph_data"
+decompile_value = "high"
+text = true
+
+[[formats]]
+type_name = "anim"
+extensions = [".anim"]
+category = "data"
+role = "animation_asset"
+decompile_value = "medium"
+text = true
+
+[[formats]]
+type_name = "controller"
+extensions = [".controller"]
+category = "data"
+role = "animation_controller_asset"
+decompile_value = "medium"
+text = true
+
+[[formats]]
+type_name = "ttf"
+extensions = [".ttf"]
+category = "data"
+role = "font_asset"
+decompile_value = "low"
+
+[[formats]]
+type_name = "otf"
+extensions = [".otf"]
+category = "data"
+role = "font_asset"
+decompile_value = "low"
+
+[[formats]]
+type_name = "asset"
+extensions = [".asset"]
+category = "data"
+role = "engine_asset_data"
+decompile_value = "medium"
+text = true
+
+[[formats]]
+type_name = "po"
+extensions = [".po"]
+category = "data"
+role = "localization_text"
+decompile_value = "high"
+text = true
+
+[[formats]]
+type_name = "mo"
+extensions = [".mo"]
+category = "data"
+role = "compiled_localization"
+decompile_value = "medium"
+
+[[formats]]
+type_name = "csv"
+extensions = [".csv"]
+category = "data"
+role = "tabular_data_text"
+decompile_value = "high"
+text = true
+
+[[formats]]
+type_name = "tsv"
+extensions = [".tsv"]
+category = "data"
+role = "tabular_data_text"
+decompile_value = "high"
+text = true
+
+[[formats]]
+type_name = "config"
+extensions = [".config"]
+category = "data"
+role = "config_text"
+decompile_value = "high"
+text = true
+
+[[formats]]
+type_name = "map"
+extensions = [".map"]
+category = "data"
+role = "source_map_or_engine_map_data"
+decompile_value = "medium"
+text = true
+
+[[formats]]
+type_name = "info"
+extensions = [".info"]
+category = "data"
+role = "metadata_text"
+decompile_value = "medium"
+text = true
+
+[[formats]]
+type_name = "dll"
+extensions = [".dll"]
+category = "runtime"
+role = "compiled_runtime_binary"
+decompile_value = "none"
+
+[[formats]]
+type_name = "exe"
+extensions = [".exe"]
+category = "runtime"
+role = "compiled_runtime_binary"
+decompile_value = "none"
+
+[[formats]]
+type_name = "pdb"
+extensions = [".pdb"]
+category = "runtime"
+role = "debug_symbols"
+decompile_value = "none"
+
+[[formats]]
+type_name = "so"
+extensions = [".so"]
+category = "runtime"
+role = "compiled_runtime_binary"
+decompile_value = "none"
+
+[[formats]]
+type_name = "wasm"
+extensions = [".wasm"]
+category = "bytecode"
+role = "webassembly_bytecode"
+decompile_value = "medium"
