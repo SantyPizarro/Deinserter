@@ -9,10 +9,12 @@ bypass encryption, DRM, or proprietary bytecode protections.
 
 ## Capability System
 
-Deinserter is built around a capability registry. A capability can be a format
-descriptor, detector, container handler, parser, semantic converter, or
-reconstruction path. This lets the project grow constantly without turning every
-new extension into a core-code change.
+Deinserter is built around a versioned capability registry. A capability can be a
+format descriptor, detector, streaming detector, container handler, path/source
+parser, converter, reconstructor, or run hook. Capabilities have stable IDs,
+priorities, source metadata, explicit replacement rules, and isolated runtime
+errors. This lets the project grow without turning every new extension into a
+core-code change.
 
 Support can be added in layers:
 
@@ -21,6 +23,13 @@ Support can be added in layers:
 - `container`: index parsing and safe entry extraction.
 - `parser`: metadata extraction for a known format.
 - `converter/reconstructor`: richer conversion into a more useful output.
+- `run hook`: optional project-wide preparation such as building a reference index.
+
+Container entries are exposed as bounded `ArtifactSource` objects and pass through
+the same detection, parsing, conversion, reconstruction, and nested-container
+pipeline without requiring a permanent extraction first. Depth, entry count,
+candidate count, memory, file-size, cooperative time, and output-byte limits apply
+to this work.
 
 Unknown files do not block a run. They are inventoried with extension, magic,
 size, entropy/string hints, and conservative classification so they can become
@@ -55,6 +64,30 @@ Use entry point plugins for installed third-party packs:
 ```toml
 [project.entry-points."deinserter.plugins"]
 my_pack = "deinserter_plugin:register"
+```
+
+Plugins should declare the supported contract version. They can register source
+parsers, streaming signatures, converters, reconstructors, and run hooks in the
+same `register(registry)` function:
+
+```python
+from deinserter import CAPABILITY_API_VERSION
+
+DEINSERTER_API_VERSION = CAPABILITY_API_VERSION
+
+def register(registry):
+    registry.add_source_parser(
+        parse_dialogue,
+        capability_id="my_pack:parser:dialogue",
+        extensions={".dialogue"},
+        priority=100,
+    )
+    registry.add_converter(
+        convert_dialogue,
+        capability_id="my_pack:converter:dialogue",
+        extensions={".dialogue"},
+        priority=100,
+    )
 ```
 
 ## Python API
@@ -95,12 +128,21 @@ deinserter probe sample.asset --explain --json
 deinserter formats list --json
 deinserter formats unknown game-folder --json
 deinserter plugin init ./deinserter-my-game
+deinserter plugin init ./deinserter-my-game --template full
 deinserter plugin validate ./deinserter-my-game --json
+deinserter plugin test ./deinserter-my-game ./sample.dialogue --expected-type example_dialogue --json
 ```
 
 The streaming-first commands write `deinserter-summary.json` plus JSONL files
-for files, candidates, extracted assets, skipped items, objects, reconstructed
-Unity records, semantic conversions, and container entries.
+for files, candidates, extracted assets, skipped items, failures, capability
+events, objects, reconstructed Unity records, semantic conversions, and container
+entries. Manifest paths are absolute so readers remain valid when the caller
+changes its working directory.
+
+Writes use same-file protection, destination-root containment, temporary files,
+and atomic replacement. `--overwrite` never permits an input file or archive to
+replace itself. `--max-output-bytes` covers extracted payloads, semantic outputs,
+Unity sidecars, and reconstructed artifacts (manifest files are excluded).
 
 `decompile_path` and the `decompile` CLI command are the canonical APIs for
 containers and large projects. `extract_path` and the `extract` CLI command
@@ -118,4 +160,5 @@ Built-in container handlers include GPAK, ZIP, Quake PAK, VPK, open RPF,
 unencrypted Unreal PAK, and unencrypted UTOC/UCAS IoStore ranges.
 
 For contribution details, see [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
+For the processing and plugin contracts, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 For the long-term roadmap, see [docs/EXPANSION_PLAN.md](docs/EXPANSION_PLAN.md).

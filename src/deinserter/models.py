@@ -49,6 +49,45 @@ class ScanOptions(JsonModel):
     container_deep_scan: bool = True
     container_keyring_path: str | None = None
     format_pack_paths: list[str] | None = None
+    disabled_plugins: list[str] | None = None
+    max_container_depth: int = 4
+    max_container_entries: int | None = 100_000
+    max_embedded_candidates: int | None = 100_000
+    max_processing_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_file_size_mb is not None and self.max_file_size_mb < 0:
+            raise ValueError("max_file_size_mb must be non-negative")
+        if self.string_min_length <= 0:
+            raise ValueError("string_min_length must be greater than zero")
+        if self.entropy_block_size <= 0:
+            raise ValueError("entropy_block_size must be greater than zero")
+        if self.max_in_memory_bytes < 0:
+            raise ValueError("max_in_memory_bytes must be non-negative")
+        if self.stream_chunk_size <= 0:
+            raise ValueError("stream_chunk_size must be greater than zero")
+        if self.max_output_bytes is not None and self.max_output_bytes < 0:
+            raise ValueError("max_output_bytes must be non-negative")
+        if self.unity_max_object_bytes is not None and self.unity_max_object_bytes < 0:
+            raise ValueError("unity_max_object_bytes must be non-negative")
+        if self.max_container_depth < 0:
+            raise ValueError("max_container_depth must be non-negative")
+        if self.max_container_entries is not None and self.max_container_entries < 0:
+            raise ValueError("max_container_entries must be non-negative")
+        if self.max_embedded_candidates is not None and self.max_embedded_candidates < 0:
+            raise ValueError("max_embedded_candidates must be non-negative")
+        if self.max_processing_seconds is not None and self.max_processing_seconds <= 0:
+            raise ValueError("max_processing_seconds must be greater than zero")
+        if self.hash_policy not in {"extracted", "always", "never"}:
+            raise ValueError(f"unsupported hash_policy: {self.hash_policy}")
+        if self.mode not in {"manifest_only", "selective", "full"}:
+            raise ValueError(f"unsupported decompilation mode: {self.mode}")
+        if self.include_categories is not None:
+            self.include_categories = [item.strip().lower() for item in self.include_categories if item.strip()]
+        if self.exclude_categories is not None:
+            self.exclude_categories = [item.strip().lower() for item in self.exclude_categories if item.strip()]
+        if self.disabled_plugins is not None:
+            self.disabled_plugins = [item.strip() for item in self.disabled_plugins if item.strip()]
 
 
 @dataclass(slots=True)
@@ -57,6 +96,11 @@ class ExtractionOptions(ScanOptions):
     preserve_paths: bool = True
     naming: NamingStrategy = "offset"
     validate_outputs: bool = True
+
+    def __post_init__(self) -> None:
+        ScanOptions.__post_init__(self)
+        if self.naming not in {"hash", "offset", "type_index"}:
+            raise ValueError(f"unsupported naming strategy: {self.naming}")
 
 
 @dataclass(slots=True)
@@ -148,6 +192,7 @@ class ManifestPaths(JsonModel):
     candidates: str = ""
     extracted: str = ""
     skipped: str = ""
+    failures: str = ""
     objects: str = ""
     reconstructed: str = ""
     assembly_types: str = ""
@@ -156,6 +201,7 @@ class ManifestPaths(JsonModel):
     unity_external_resources: str = ""
     unreal_entries: str = ""
     container_entries: str = ""
+    capability_events: str = ""
 
 
 @dataclass(slots=True)

@@ -3,13 +3,14 @@ from __future__ import annotations
 import hashlib
 import struct
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
-from typing import Protocol
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import BinaryIO, Iterable, Iterator, Protocol
 
 from .classification import classify_asset
 from .gpak import parse_gpak_index
-from .resources import copy_range_streaming
+from .resources import ArtifactSource, atomic_binary_writer, copy_range_streaming, ensure_distinct_paths
 from .utils import ensure_unique
 
 
@@ -28,6 +29,7 @@ class ContainerEntry:
     decompile_value: str
     role: str
     source_container: str
+    original_name: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -39,6 +41,7 @@ class ContainerEntry:
             "decompile_value": self.decompile_value,
             "role": self.role,
             "source_container": self.source_container,
+            "original_name": self.original_name or self.name,
         }
 
 
@@ -85,10 +88,10 @@ class ContainerInfo:
 @dataclass(slots=True)
 class OpenContainer:
     info: ContainerInfo
-    entries: list[ContainerEntry]
+    entries: Iterable[ContainerEntry]
 
-    def iter_entries(self) -> list[ContainerEntry]:
-        return self.entries
+    def iter_entries(self) -> Iterator[ContainerEntry]:
+        return iter(self.entries)
 
 
 class ContainerHandler(Protocol):
@@ -103,7 +106,7 @@ class ContainerHandler(Protocol):
     def inspect(self, path: Path) -> ContainerInfo:
         ...
 
-    def iter_entries(self, path: Path) -> list[ContainerEntry]:
+    def iter_entries(self, path: Path) -> Iterator[ContainerEntry]:
         ...
 
     def extract_entry(
@@ -124,29 +127,68 @@ def _entry_type(name: str) -> str:
 
 
 def _safe_archive_name(name: str) -> str:
-    parts = [
-        part
-        for part in PurePosixPath(name.replace("\\", "/")).parts
-        if part not in {"", ".", "..", "/", "\\"} and not part.endswith(":")
-    ]
+    normalized = name.replace("\\", "/")
+    posix_path = PurePosixPath(normalized)
+    windows_path = PureWindowsPath(name)
+    if (
+        not normalized
+        or normalized.startswith("/")
+        or normalized.startswith("//")
+        or posix_path.is_absolute()
+        or windows_path.is_absolute()
+        or bool(windows_path.drive)
+    ):
+        raise ValueError(f"unsafe absolute archive path: {name}")
+    raw_parts = posix_path.parts
+    if any(
+        part in {"..", "/", "\\", "//"}
+        or part.endswith(":")
+        or PureWindowsPath(part).is_reserved()
+        for part in raw_parts
+    ):
+        raise ValueError(f"unsafe archive path: {name}")
+    parts = [part for part in raw_parts if part not in {"", "."}]
     return "/".join(parts) if parts else "unnamed"
 
 
+def _safe_mount_prefix(name: str) -> str:
+    """Normalize archive metadata mount points without trusting their roots."""
+    normalized = name.replace("\\", "/")
+    parts = [
+        part
+        for part in PurePosixPath(normalized).parts
+        if part not in {"", ".", "..", "/", "\\", "//"} and not part.endswith(":")
+    ]
+    return "/".join(parts)
+
+
 def _safe_output_path(output_dir: Path, name: str, overwrite: bool) -> Path:
+    root = output_dir.resolve(strict=False)
     relative = Path(*Path(_safe_archive_name(name)).parts)
-    destination = output_dir / relative
+    if relative.is_absolute():
+        raise ValueError(f"unsafe rooted archive path: {name}")
+    destination = root / relative
+    try:
+        destination.resolve(strict=False).relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"archive output escapes destination root: {name}") from exc
     destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        destination.resolve(strict=False).relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"archive output traverses outside destination root: {name}") from exc
     if destination.exists() and not overwrite:
         destination = ensure_unique(destination)
     return destination
 
 
 def _container_entry(container_path: Path, name: str, size: int, offset: int | None) -> ContainerEntry:
-    name = _safe_archive_name(name)
-    detected_type = _entry_type(name)
-    classification = classify_asset(name, detected_type)
+    original_name = name
+    safe_name = _safe_archive_name(name)
+    detected_type = _entry_type(safe_name)
+    classification = classify_asset(safe_name, detected_type)
     return ContainerEntry(
-        name=name,
+        name=safe_name,
         size=size,
         offset=offset,
         type=detected_type,
@@ -154,6 +196,7 @@ def _container_entry(container_path: Path, name: str, size: int, offset: int | N
         decompile_value=classification["decompile_value"],
         role=classification["role"],
         source_container=str(container_path),
+        original_name=original_name,
     )
 
 
@@ -178,7 +221,7 @@ class GpakContainerHandler:
     def inspect(self, path: Path) -> ContainerInfo:
         return self.open(path).info
 
-    def iter_entries(self, path: Path) -> list[ContainerEntry]:
+    def iter_entries(self, path: Path) -> Iterator[ContainerEntry]:
         return self.open(path).iter_entries()
 
     def extract_entry(
@@ -226,7 +269,7 @@ class ZipContainerHandler:
     def inspect(self, path: Path) -> ContainerInfo:
         return self.open(path).info
 
-    def iter_entries(self, path: Path) -> list[ContainerEntry]:
+    def iter_entries(self, path: Path) -> Iterator[ContainerEntry]:
         return self.open(path).iter_entries()
 
     def extract_entry(
@@ -240,7 +283,9 @@ class ZipContainerHandler:
     ) -> tuple[Path, str]:
         digest = hashlib.sha256() if hash_output else None
         destination = _safe_output_path(output_dir, entry.name, overwrite)
-        with zipfile.ZipFile(path) as archive, archive.open(entry.name) as src, destination.open("wb") as out:
+        archive_name = entry.original_name or entry.name
+        ensure_distinct_paths(path, destination)
+        with zipfile.ZipFile(path) as archive, archive.open(archive_name) as src, atomic_binary_writer(destination) as out:
             while True:
                 chunk = src.read(chunk_size)
                 if not chunk:
@@ -249,6 +294,24 @@ class ZipContainerHandler:
                 if digest is not None:
                     digest.update(chunk)
         return destination, digest.hexdigest() if digest is not None else ""
+
+    def source_for_entry(self, path: Path, entry: ContainerEntry, chunk_size: int) -> ArtifactSource:
+        archive_name = entry.original_name or entry.name
+
+        @contextmanager
+        def open_entry() -> Iterator[BinaryIO]:
+            with zipfile.ZipFile(path) as archive:
+                with archive.open(archive_name) as handle:
+                    yield handle
+
+        return ArtifactSource(
+            size=entry.size,
+            name=entry.name,
+            opener=open_entry,
+            source_path=path,
+            source_offset=entry.offset or 0,
+            chunk_size=chunk_size,
+        )
 
 
 class PakContainerHandler:
@@ -289,7 +352,7 @@ class PakContainerHandler:
     def inspect(self, path: Path) -> ContainerInfo:
         return self.open(path).info
 
-    def iter_entries(self, path: Path) -> list[ContainerEntry]:
+    def iter_entries(self, path: Path) -> Iterator[ContainerEntry]:
         return self.open(path).iter_entries()
 
     def extract_entry(
@@ -406,7 +469,7 @@ class VpkContainerHandler:
     def inspect(self, path: Path) -> ContainerInfo:
         return self.open(path).info
 
-    def iter_entries(self, path: Path) -> list[ContainerEntry]:
+    def iter_entries(self, path: Path) -> Iterator[ContainerEntry]:
         return self.open(path).iter_entries()
 
     def extract_entry(
@@ -427,7 +490,10 @@ class VpkContainerHandler:
             return destination, digest
 
         digest = hashlib.sha256() if hash_output else None
-        with destination.open("wb") as out:
+        ensure_distinct_paths(path, destination)
+        if entry.archive_path:
+            ensure_distinct_paths(entry.archive_path, destination)
+        with atomic_binary_writer(destination) as out:
             if entry.preload_size:
                 if entry.preload_offset is None:
                     raise ValueError(f"VPK preload has no offset: {entry.name}")
@@ -516,7 +582,7 @@ class RpfContainerHandler:
     def inspect(self, path: Path) -> ContainerInfo:
         return self.open(path).info
 
-    def iter_entries(self, path: Path) -> list[ContainerEntry]:
+    def iter_entries(self, path: Path) -> Iterator[ContainerEntry]:
         return self.open(path).iter_entries()
 
     def extract_entry(
@@ -660,7 +726,8 @@ class UnrealPakContainerHandler:
         for _ in range(entry_count):
             entry, cursor = self._parse_real_entry(index, cursor, archive_size)
             if mount_point:
-                entry.name = _safe_archive_name(f"{mount_point.rstrip('/')}/{entry.name}")
+                safe_mount = _safe_mount_prefix(mount_point)
+                entry.name = _safe_archive_name(f"{safe_mount}/{entry.name}" if safe_mount else entry.name)
             entry.source_container = str(path)
             entries.append(entry)
         info = ContainerInfo(
@@ -713,7 +780,7 @@ class UnrealPakContainerHandler:
     def inspect(self, path: Path) -> ContainerInfo:
         return self.open(path).info
 
-    def iter_entries(self, path: Path) -> list[ContainerEntry]:
+    def iter_entries(self, path: Path) -> Iterator[ContainerEntry]:
         return self.open(path).iter_entries()
 
     def extract_entry(
@@ -856,7 +923,7 @@ class UtocContainerHandler:
     def inspect(self, path: Path) -> ContainerInfo:
         return self.open(path).info
 
-    def iter_entries(self, path: Path) -> list[ContainerEntry]:
+    def iter_entries(self, path: Path) -> Iterator[ContainerEntry]:
         return self.open(path).iter_entries()
 
     def extract_entry(
@@ -905,3 +972,24 @@ def find_container_handler(
         if handler.sniff(file_path):
             return handler
     return None
+
+
+def source_for_container_entry(
+    handler: object,
+    container_path: Path,
+    entry: ContainerEntry,
+    chunk_size: int,
+) -> ArtifactSource | None:
+    source_factory = getattr(handler, "source_for_entry", None)
+    if callable(source_factory):
+        return source_factory(container_path, entry, chunk_size)
+    if entry.offset is None:
+        return None
+    source_path = Path(entry.source_container or container_path)
+    return ArtifactSource.from_path(
+        source_path,
+        offset=entry.offset,
+        length=entry.size,
+        name=entry.name,
+        chunk_size=chunk_size,
+    )

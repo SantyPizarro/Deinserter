@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
 from .models import ManifestPaths
+from .resources import atomic_text_writer, write_text_atomic
 
 
 MANIFEST_KEYS = {
@@ -12,6 +14,7 @@ MANIFEST_KEYS = {
     "candidates",
     "extracted",
     "skipped",
+    "failures",
     "objects",
     "reconstructed",
     "assembly_types",
@@ -20,6 +23,7 @@ MANIFEST_KEYS = {
     "unity_external_resources",
     "unreal_entries",
     "container_entries",
+    "capability_events",
 }
 
 
@@ -28,7 +32,9 @@ class JsonlManifestWriter:
         self.output_dir = Path(output_dir) if output_dir is not None else None
         self.paths = ManifestPaths()
         self._handles: dict[str, Any] = {}
+        self._stack = ExitStack()
         if self.output_dir is not None:
+            self.output_dir = self.output_dir.resolve()
             self.output_dir.mkdir(parents=True, exist_ok=True)
             self.paths = ManifestPaths(
                 summary=str(self.output_dir / "deinserter-summary.json"),
@@ -36,6 +42,7 @@ class JsonlManifestWriter:
                 candidates=str(self.output_dir / "candidates.jsonl"),
                 extracted=str(self.output_dir / "extracted.jsonl"),
                 skipped=str(self.output_dir / "skipped.jsonl"),
+                failures=str(self.output_dir / "failures.jsonl"),
                 objects=str(self.output_dir / "objects.jsonl"),
                 reconstructed=str(self.output_dir / "reconstructed.jsonl"),
                 assembly_types=str(self.output_dir / "assembly-types.jsonl"),
@@ -44,12 +51,14 @@ class JsonlManifestWriter:
                 unity_external_resources=str(self.output_dir / "unity-external-resources.jsonl"),
                 unreal_entries=str(self.output_dir / "unreal-entries.jsonl"),
                 container_entries=str(self.output_dir / "container-entries.jsonl"),
+                capability_events=str(self.output_dir / "capability-events.jsonl"),
             )
             for key in (
                 "files",
                 "candidates",
                 "extracted",
                 "skipped",
+                "failures",
                 "objects",
                 "reconstructed",
                 "assembly_types",
@@ -58,17 +67,16 @@ class JsonlManifestWriter:
                 "unity_external_resources",
                 "unreal_entries",
                 "container_entries",
+                "capability_events",
             ):
-                Path(getattr(self.paths, key)).write_text("", encoding="utf-8")
+                self._handles[key] = self._stack.enter_context(
+                    atomic_text_writer(getattr(self.paths, key))
+                )
 
     def _write_jsonl(self, key: str, item: dict[str, Any]) -> None:
         if self.output_dir is None:
             return
-        handle = self._handles.get(key)
-        if handle is None:
-            path = getattr(self.paths, key)
-            handle = Path(path).open("w", encoding="utf-8")
-            self._handles[key] = handle
+        handle = self._handles[key]
         handle.write(json.dumps(item, ensure_ascii=False) + "\n")
 
     def file(self, item: dict[str, Any]) -> None:
@@ -82,6 +90,9 @@ class JsonlManifestWriter:
 
     def skipped(self, item: dict[str, Any]) -> None:
         self._write_jsonl("skipped", item)
+
+    def failure(self, item: dict[str, Any]) -> None:
+        self._write_jsonl("failures", item)
 
     def object(self, item: dict[str, Any]) -> None:
         self._write_jsonl("objects", item)
@@ -107,15 +118,17 @@ class JsonlManifestWriter:
     def container_entry(self, item: dict[str, Any]) -> None:
         self._write_jsonl("container_entries", item)
 
+    def capability_event(self, item: dict[str, Any]) -> None:
+        self._write_jsonl("capability_events", item)
+
     def summary(self, item: dict[str, Any]) -> None:
         if self.output_dir is None:
             return
-        Path(self.paths.summary).write_text(json.dumps(item, indent=2, ensure_ascii=False), encoding="utf-8")
+        self.close()
+        write_text_atomic(self.paths.summary, json.dumps(item, indent=2, ensure_ascii=False))
 
     def close(self) -> None:
-        for handle in self._handles.values():
-            handle.close()
-        self._handles.clear()
+        self._stack.close()
 
     def __enter__(self) -> "JsonlManifestWriter":
         return self
@@ -150,7 +163,12 @@ class ManifestReader:
         manifest_paths = summary.get("manifest_paths", {})
         declared = manifest_paths.get(key)
         if declared:
-            return Path(declared)
+            declared_path = Path(declared)
+            if declared_path.is_absolute():
+                return declared_path
+            if declared_path.exists():
+                return declared_path.resolve()
+            return self.output_dir / declared_path.name
         filename = key.replace("_", "-") + ".jsonl"
         if key == "assembly_types":
             filename = "assembly-types.jsonl"
@@ -236,6 +254,9 @@ class ManifestReader:
     def iter_skipped(self, **filters: object):
         yield from self.iter_records("skipped", **filters)
 
+    def iter_failures(self, **filters: object):
+        yield from self.iter_records("failures", **filters)
+
     def iter_objects(self, **filters: object):
         yield from self.iter_records("objects", **filters)
 
@@ -259,6 +280,9 @@ class ManifestReader:
 
     def iter_container_entries(self, **filters: object):
         yield from self.iter_records("container_entries", **filters)
+
+    def iter_capability_events(self, **filters: object):
+        yield from self.iter_records("capability_events", **filters)
 
 
 def read_manifest(path: str | Path) -> ManifestReader:

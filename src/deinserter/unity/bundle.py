@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..resources import atomic_binary_writer, ensure_distinct_paths
 from .lz4 import decompress_lz4_block
 
 
@@ -325,7 +326,8 @@ def extract_bundle_entry(
     uncompressed_cursor = 0
     if info.data_offset is None:
         raise ValueError("UnityFS data offset unavailable")
-    with path.open("rb") as handle, destination.open("wb") as out:
+    ensure_distinct_paths(path, destination)
+    with path.open("rb") as handle, atomic_binary_writer(destination) as out:
         for span in _block_spans(info):
             block = span.block
             block_start = span.uncompressed_start

@@ -4,10 +4,12 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import dataclass, field
+from time import monotonic
 from typing import Iterable
 
 from .assembly import iter_assembly_types
 from .classification import classify_asset, should_extract_category
+from .containers import source_for_container_entry
 from .detectors import Detector
 from .manifests import JsonlManifestWriter
 from .models import (
@@ -23,12 +25,19 @@ from .models import (
     ScanOptions,
     ScanReport,
 )
-from .registry import CapabilityRegistry, build_capability_registry, use_registry
-from .resources import ByteSource, copy_file_streaming, copy_range_streaming
-from .semantic import build_semantic_conversion
+from .registry import CapabilityContext, CapabilityRegistry, ProcessorCapability, RunContext, build_capability_registry, use_registry
+from .resources import (
+    ArtifactSource,
+    ByteSource,
+    copy_artifact_range,
+    copy_file_streaming,
+    copy_range_streaming,
+    sha256_artifact_range,
+    sha256_range,
+    write_text_atomic,
+)
 from .stream_scanner import scan_embedded_streaming
 from .unity.bundle import extract_bundle_entry, inspect_bundle
-from .unity.index import UnityProjectIndex
 from .unity.reconstruct import reconstruct_unity_object, should_reconstruct_unity_object
 from .unity.serialized import inspect_serialized_file
 from .utils import (
@@ -36,13 +45,11 @@ from .utils import (
     ensure_unique,
     magic_hex,
     safe_relative_path,
-    sha256_bytes,
     sha256_file,
     shannon_entropy,
     strings_preview,
 )
-
-VERSION = "0.1.0"
+from ._version import VERSION
 
 
 def _now() -> str:
@@ -58,7 +65,9 @@ def _coerce_extraction_options(options: ExtractionOptions | None) -> ExtractionO
 
 
 def _registry_for_options(options: ScanOptions) -> CapabilityRegistry:
-    return build_capability_registry(options.format_pack_paths)
+    registry = build_capability_registry(options.format_pack_paths, disabled_plugins=options.disabled_plugins or ())
+    registry.configure(options)
+    return registry
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -110,8 +119,13 @@ def _apply_classification(identified: FileIdentification, name: str, registry: C
 
 
 def _identify_from_bytes(path: Path, data: bytes, registry: CapabilityRegistry) -> FileIdentification:
-    for detector in registry.detectors:
-        identified = detector.identify(data, path)
+    for record in registry.detector_capabilities:
+        detector = record.value
+        try:
+            identified = detector.identify(data, path)
+        except Exception as exc:  # third-party capability boundary
+            registry.record_runtime_error(record, path, exc)
+            continue
         if identified is not None:
             return _apply_classification(identified, str(path), registry)
     return _apply_classification(
@@ -128,6 +142,14 @@ def _detector_for_type(type_name: str, registry: CapabilityRegistry) -> Detector
     return None
 
 
+def _extension_for_type(type_name: str, registry: CapabilityRegistry) -> str:
+    detector = _detector_for_type(type_name, registry)
+    if detector is not None:
+        return getattr(detector, "extension", f".{type_name}")
+    streaming = registry.find_streaming_detector(type_name)
+    return streaming.extension if streaming is not None else f".{type_name}"
+
+
 def _classify_candidate(candidate: EmbeddedCandidate, registry: CapabilityRegistry) -> EmbeddedCandidate:
     classification = classify_asset(f"asset.{candidate.detected_type}", candidate.detected_type, registry)
     candidate.category = classification["category"]
@@ -142,6 +164,13 @@ def identify_file(path: str | Path, options: ScanOptions | None = None) -> FileI
     registry = _registry_for_options(scan_options)
     file_path = Path(path)
     with use_registry(registry):
+        if (
+            scan_options.max_file_size_mb is not None
+            and file_path.stat().st_size > scan_options.max_file_size_mb * 1024 * 1024
+        ):
+            identified = _identify_from_bytes(file_path, b"", registry)
+            identified.status = "skipped_size_limit"
+            return identified
         handler = registry.find_container_handler(file_path, scan_options.container_deep_scan)
         if handler is not None:
             with file_path.open("rb") as handle:
@@ -166,6 +195,25 @@ def probe_file(path: str | Path, options: ScanOptions | None = None, registry: C
     with use_registry(registry):
         size = file_path.stat().st_size
         digest = sha256_file(file_path) if scan_options.hash_policy == "always" else ""
+        if scan_options.max_file_size_mb is not None and size > scan_options.max_file_size_mb * 1024 * 1024:
+            identified = _identify_from_bytes(file_path, b"", registry)
+            warning = f"file_exceeds_max_file_size_mb:{scan_options.max_file_size_mb}"
+            return ProbeReport(
+                path=str(file_path),
+                size=size,
+                sha256=digest,
+                extension=file_path.suffix.lower(),
+                identified_type=identified.identified_type,
+                confidence=identified.confidence,
+                magic="",
+                entropy=None,
+                status="skipped_size_limit",
+                warnings=[warning],
+                category=identified.category,
+                decompile_value=identified.decompile_value,
+                reason=identified.reason,
+                parse_info=registry.describe_file(file_path, identified.identified_type, identified.category),
+            )
         handler = registry.find_container_handler(file_path, scan_options.container_deep_scan)
         if handler is not None:
             info = handler.inspect(file_path)
@@ -197,7 +245,11 @@ def probe_file(path: str | Path, options: ScanOptions | None = None, registry: C
         data, warnings, status = _read_for_probe(file_path, scan_options)
         if data is None:
             source = ByteSource(file_path, scan_options.stream_chunk_size)
-            header = source.read_at(0, min(4096, source.size)) if status == "streaming_probe" else b""
+            header = (
+                source.read_at(0, min(max(4096, scan_options.entropy_block_size), source.size))
+                if status == "streaming_probe"
+                else b""
+            )
             identified = _identify_from_bytes(file_path, header, registry) if header else _apply_classification(
                 FileIdentification(str(file_path), "unknown", 0.0, file_path.suffix.lower(), "", "unknown"),
                 str(file_path),
@@ -206,7 +258,12 @@ def probe_file(path: str | Path, options: ScanOptions | None = None, registry: C
             entropy = shannon_entropy(header) if header else None
             candidates: list[EmbeddedCandidate] = []
             if status == "streaming_probe" and scan_options.embedded_scan:
-                candidates = scan_embedded_streaming(str(file_path), scan_options)
+                candidates = scan_embedded_streaming(
+                    ArtifactSource.from_path(file_path, chunk_size=scan_options.stream_chunk_size),
+                    scan_options,
+                    registry.streaming_detectors,
+                    lambda detector, exc: registry.record_runtime_error(detector, file_path, exc),
+                )
             return ProbeReport(
                 path=str(file_path),
                 size=size,
@@ -223,15 +280,31 @@ def probe_file(path: str | Path, options: ScanOptions | None = None, registry: C
                 category=identified.category,
                 decompile_value=identified.decompile_value,
                 reason=identified.reason,
-                parse_info=registry.parse_file(file_path, identified.identified_type, identified.category),
+                parse_info=registry.parse_source(
+                    ArtifactSource.from_path(file_path, chunk_size=scan_options.stream_chunk_size),
+                    file_path,
+                    identified.identified_type,
+                    identified.category,
+                    materialize_limit=scan_options.max_in_memory_bytes,
+                ),
             )
 
         identified = _identify_from_bytes(file_path, data, registry)
-        entropy = shannon_entropy(data)
+        entropy = shannon_entropy(data[: scan_options.entropy_block_size])
         candidates: list[EmbeddedCandidate] = []
         if scan_options.embedded_scan:
-            for detector in registry.detectors:
-                candidates.extend(_classify_candidate(candidate, registry) for candidate in detector.find_embedded(data, str(file_path)))
+            for record in registry.detector_capabilities:
+                detector = record.value
+                try:
+                    found = detector.find_embedded(data, str(file_path))
+                except Exception as exc:  # third-party capability boundary
+                    registry.record_runtime_error(record, file_path, exc)
+                    continue
+                candidates.extend(_classify_candidate(candidate, registry) for candidate in found)
+                if scan_options.max_embedded_candidates is not None and len(candidates) >= scan_options.max_embedded_candidates:
+                    candidates = candidates[: scan_options.max_embedded_candidates]
+                    warnings.append(f"embedded_candidate_limit_reached:{scan_options.max_embedded_candidates}")
+                    break
         return ProbeReport(
             path=str(file_path),
             size=size,
@@ -249,8 +322,96 @@ def probe_file(path: str | Path, options: ScanOptions | None = None, registry: C
             category=identified.category,
             decompile_value=identified.decompile_value,
             reason=identified.reason,
-            parse_info=registry.parse_file(file_path, identified.identified_type, identified.category),
+            parse_info=registry.parse_source(
+                ArtifactSource.from_path(file_path, chunk_size=scan_options.stream_chunk_size),
+                file_path,
+                identified.identified_type,
+                identified.category,
+                materialize_limit=scan_options.max_in_memory_bytes,
+            ),
         )
+
+
+def probe_artifact_source(
+    source: ArtifactSource,
+    logical_path: Path,
+    options: ScanOptions,
+    registry: CapabilityRegistry,
+) -> ProbeReport:
+    warnings: list[str] = []
+    if source.size <= options.max_in_memory_bytes:
+        data = source.read_all(options.max_in_memory_bytes)
+        identified = _identify_from_bytes(logical_path, data, registry)
+        entropy = shannon_entropy(data[: options.entropy_block_size])
+        candidates: list[EmbeddedCandidate] = []
+        if options.embedded_scan:
+            for record in registry.detector_capabilities:
+                detector = record.value
+                try:
+                    found = detector.find_embedded(data, str(logical_path))
+                except Exception as exc:
+                    registry.record_runtime_error(record, logical_path, exc)
+                    continue
+                candidates.extend(_classify_candidate(candidate, registry) for candidate in found)
+                if options.max_embedded_candidates is not None and len(candidates) >= options.max_embedded_candidates:
+                    candidates = candidates[: options.max_embedded_candidates]
+                    warnings.append(f"embedded_candidate_limit_reached:{options.max_embedded_candidates}")
+                    break
+        candidates = [
+            candidate
+            for candidate in candidates
+            if not (
+                candidate.offset == 0
+                and candidate.length == source.size
+                and candidate.detected_type == identified.identified_type
+            )
+        ]
+        status = identified.status if identified.status != "unknown" else "unknown"
+        preview = strings_preview(data, options.string_min_length)
+        hints = compression_hints(data, entropy)
+    else:
+        header = source.read_at(0, min(max(4096, options.entropy_block_size), source.size))
+        identified = _identify_from_bytes(logical_path, header, registry)
+        entropy = shannon_entropy(header)
+        candidates = (
+            scan_embedded_streaming(
+                source,
+                options,
+                registry.streaming_detectors,
+                lambda detector, exc: registry.record_runtime_error(detector, logical_path, exc),
+            )
+            if options.embedded_scan
+            else []
+        )
+        status = "streaming_probe"
+        preview = strings_preview(header, options.string_min_length)
+        hints = compression_hints(header, entropy)
+        warnings.append(f"streaming_probe:size_exceeds_max_in_memory_bytes:{options.max_in_memory_bytes}")
+    return ProbeReport(
+        path=str(logical_path),
+        size=source.size,
+        sha256="",
+        extension=logical_path.suffix.lower(),
+        identified_type=identified.identified_type,
+        confidence=identified.confidence,
+        magic=identified.magic,
+        entropy=entropy,
+        strings_preview=preview,
+        embedded_candidates=candidates,
+        compression_hints=hints,
+        status=status,
+        warnings=warnings,
+        category=identified.category,
+        decompile_value=identified.decompile_value,
+        reason=identified.reason,
+        parse_info=registry.parse_source(
+            source,
+            logical_path,
+            identified.identified_type,
+            identified.category,
+            materialize_limit=options.max_in_memory_bytes,
+        ),
+    )
 
 
 def _summary(files: list[FileReport]) -> dict[str, object]:
@@ -311,8 +472,9 @@ def scan_path(input_path: str | Path, options: ScanOptions | None = None) -> Sca
                 probe = probe_file(file_path, scan_options, registry)
                 files.append(_file_report_from_probe(probe))
                 warnings.extend(f"{file_path}: {warning}" for warning in probe.warnings)
-            except OSError as exc:
+            except Exception as exc:
                 warnings.append(f"{file_path}: {exc}")
+            warnings.extend(f"capability_runtime: {warning}" for warning in registry.drain_runtime_errors())
     finished_at = _now()
     return ScanReport(
         version=VERSION,
@@ -338,6 +500,7 @@ def _empty_summary() -> dict[str, object]:
         "planned_output_bytes": 0,
         "extracted_total": 0,
         "extracted_bytes": 0,
+        "output_bytes": 0,
         "failed_total": 0,
         "skipped_total": 0,
         "unity_objects_total": 0,
@@ -361,6 +524,9 @@ def _empty_summary() -> dict[str, object]:
         "semantic_noop_total": 0,
         "semantic_pseudocode_total": 0,
         "semantic_failed_total": 0,
+        "semantic_blocked_total": 0,
+        "capability_events_total": 0,
+        "deadline_reached": False,
         "by_unity_class": {},
         "by_semantic_classification": {},
     }
@@ -369,8 +535,8 @@ def _empty_summary() -> dict[str, object]:
 @dataclass(slots=True)
 class RunState:
     writer: JsonlManifestWriter
-    unity_index: UnityProjectIndex = field(default_factory=UnityProjectIndex)
-    unity_resource_files: list[Path] = field(default_factory=list)
+    services: dict[str, object] = field(default_factory=dict)
+    deadline: float | None = None
     summary: dict[str, object] = field(default_factory=_empty_summary)
     warnings: list[str] = field(default_factory=list)
     files_sample: list[dict[str, object]] = field(default_factory=list)
@@ -387,6 +553,16 @@ def _bump(mapping: dict[str, int], key: str, amount: int = 1) -> None:
 def _sample_append(sample: list[dict[str, object]], item: dict[str, object], limit: int = 50) -> None:
     if len(sample) < limit:
         sample.append(item)
+
+
+def _deadline_exceeded(state: RunState) -> bool:
+    if state.deadline is None or monotonic() < state.deadline:
+        return False
+    warning = "processing_deadline_reached"
+    state.summary["deadline_reached"] = True
+    if warning not in state.warnings:
+        state.warnings.append(warning)
+    return True
 
 
 def _safe_stem(value: str) -> str:
@@ -439,7 +615,7 @@ def _output_path_for_direct_file(root: Path, file_path: Path, output_dir: Path, 
 def _can_write_bytes(summary: dict[str, object], options: ScanOptions, size: int) -> bool:
     if options.max_output_bytes is None:
         return True
-    return int(summary["extracted_bytes"]) + size <= options.max_output_bytes
+    return int(summary["output_bytes"]) + size <= options.max_output_bytes
 
 
 def _record_skipped(
@@ -461,6 +637,7 @@ def _record_extracted(
 ) -> None:
     summary["extracted_total"] = int(summary["extracted_total"]) + 1
     summary["extracted_bytes"] = int(summary["extracted_bytes"]) + int(item.get("length", 0))
+    summary["output_bytes"] = int(summary["output_bytes"]) + int(item.get("length", 0))
     writer.extracted(item)
     _sample_append(sample, item)
 
@@ -470,6 +647,7 @@ def _record_failure(state: RunState, file_path: Path, reason: str, entry: str | 
     if entry is not None:
         failure["entry"] = entry
     state.summary["failed_total"] = int(state.summary["failed_total"]) + 1
+    state.writer.failure(failure)
     _sample_append(state.failed_sample, failure)
 
 
@@ -483,12 +661,106 @@ def _record_semantic_conversion(state: RunState, item: dict[str, object] | None)
     status = str(item.get("status") or "")
     if status == "converted":
         state.summary["semantic_converted_total"] = int(state.summary["semantic_converted_total"]) + 1
+        state.summary["output_bytes"] = int(state.summary["output_bytes"]) + int(item.get("output_length", 0))
     elif status == "no_conversion_required":
         state.summary["semantic_noop_total"] = int(state.summary["semantic_noop_total"]) + 1
     elif status == "pseudocode":
         state.summary["semantic_pseudocode_total"] = int(state.summary["semantic_pseudocode_total"]) + 1
+        state.summary["output_bytes"] = int(state.summary["output_bytes"]) + int(item.get("output_length", 0))
     elif status == "semantic_conversion_failed":
         state.summary["semantic_failed_total"] = int(state.summary["semantic_failed_total"]) + 1
+    elif status in {"blocked_output_budget", "blocked_materialization_limit"}:
+        state.summary["semantic_blocked_total"] = int(state.summary["semantic_blocked_total"]) + 1
+        _record_skipped(state.writer, state.summary, state.skipped_sample, item | {"reason": status})
+
+
+def _record_capability_event(state: RunState, item: dict[str, object]) -> None:
+    state.writer.capability_event(item)
+    state.summary["capability_events_total"] = int(state.summary["capability_events_total"]) + 1
+
+
+def _processor_emitter(state: RunState, stream: str, item: dict[str, object]) -> None:
+    if stream == "semantic_conversion":
+        _record_semantic_conversion(state, item)
+        return
+    if stream == "output":
+        state.summary["output_bytes"] = int(state.summary["output_bytes"]) + int(item.get("output_length", 0))
+    _record_capability_event(state, {"stream": stream, **item})
+
+
+def _run_registered_processors(
+    kind: str,
+    capabilities: list[ProcessorCapability],
+    context: CapabilityContext,
+    state: RunState,
+) -> None:
+    for capability in capabilities:
+        if _deadline_exceeded(state):
+            break
+        try:
+            result = capability.processor(context)
+        except Exception as exc:
+            context.registry.record_runtime_error(capability, context.logical_path, exc)
+            _record_failure(state, context.logical_path, f"{capability.capability_id}: {exc}")
+            continue
+        if result is None:
+            continue
+        records = result if isinstance(result, list) else [result]
+        for record in records:
+            if not isinstance(record, dict):
+                error = TypeError(f"processor result must be a dict or list of dicts, got {type(record).__name__}")
+                context.registry.record_runtime_error(capability, context.logical_path, error)
+                _record_failure(state, context.logical_path, f"{capability.capability_id}: {error}")
+                continue
+            _record_capability_event(
+                state,
+                {
+                    "kind": kind,
+                    "capability_id": capability.capability_id,
+                    "capability_source": capability.source,
+                    "logical_path": str(context.logical_path),
+                    **record,
+                }
+            )
+
+
+def _capability_context(
+    *,
+    root: Path,
+    file_path: Path,
+    output_dir: Path | None,
+    identified_type: str,
+    category: str,
+    decompile_value: str,
+    parse_info: dict[str, object],
+    state: RunState,
+    options: ExtractionOptions,
+    registry: CapabilityRegistry,
+    probe: ProbeReport | None = None,
+    depth: int = 0,
+    source: ArtifactSource | None = None,
+) -> CapabilityContext:
+    return CapabilityContext(
+        root=root,
+        logical_path=file_path,
+        source=source or ArtifactSource.from_path(file_path, chunk_size=options.stream_chunk_size),
+        identified_type=identified_type,
+        category=category,
+        decompile_value=decompile_value,
+        parse_info=dict(parse_info),
+        output_dir=output_dir,
+        options=options,
+        registry=registry,
+        depth=depth,
+        services={
+            **state.services,
+            "state": state,
+            "probe": probe,
+            "emit": lambda stream, item: _processor_emitter(state, stream, item),
+            "can_write": lambda size: _can_write_bytes(state.summary, options, size),
+            "deadline_exceeded": lambda: _deadline_exceeded(state),
+        },
+    )
 
 
 def _container_output_validation_status(
@@ -515,6 +787,7 @@ def maybe_extract_container_entry(
     state: RunState,
     options: ExtractionOptions,
     registry: CapabilityRegistry,
+    source_display_path: Path | None = None,
 ) -> None:
     candidate = entry.to_dict()
     candidate["extractable"] = True
@@ -562,7 +835,7 @@ def maybe_extract_container_entry(
             {
                 "output_path": str(out_path),
                 "type": entry.type,
-                "source_path": str(file_path),
+                "source_path": str(source_display_path or file_path),
                 "source_offset": entry.offset,
                 "length": entry.size,
                 "sha256": digest,
@@ -571,8 +844,8 @@ def maybe_extract_container_entry(
                 "decompile_value": entry.decompile_value,
             },
         )
-    except (OSError, EOFError, ValueError) as exc:
-        _record_failure(state, file_path, str(exc), entry.name)
+    except Exception as exc:
+        _record_failure(state, source_display_path or file_path, str(exc), entry.name)
 
 
 def maybe_extract_direct_file(
@@ -659,11 +932,6 @@ class _UnityResourceResolution:
     path: Path | None
     status: str
     resolution_status: str
-
-
-def _is_unity_resource_path(path: Path) -> bool:
-    name = path.name.lower()
-    return path.suffix.lower() in {".resource", ".ress"} or name.endswith(".ress")
 
 
 def _unity_resource_kind(class_id: int) -> str:
@@ -770,16 +1038,27 @@ def _process_unity_serialized_file(
     state: RunState,
     options: ExtractionOptions,
 ) -> None:
-    info = state.unity_index.ensure_file(file_path)
+    unity_index = state.services.get("unity_index")
+    if unity_index is None:
+        from .unity.index import UnityProjectIndex
+
+        unity_index = UnityProjectIndex()
+        state.services["unity_index"] = unity_index
+    info = unity_index.ensure_file(file_path)
     objects = info.objects
     state.summary["unity_external_files_total"] = int(state.summary["unity_external_files_total"]) + len(info.externals)
     for obj in objects:
-        state.unity_index.resolve_object_references(obj)
+        unity_index.resolve_object_references(obj)
         for streaming_info in obj.streaming_infos:
             length = int(streaming_info.get("size") or 0)
             offset = int(streaming_info.get("offset") or 0)
             resource_kind = _unity_resource_kind(obj.class_id)
-            resolution = _resolve_unity_resource(file_path, streaming_info, options, state.unity_resource_files)
+            resolution = _resolve_unity_resource(
+                file_path,
+                streaming_info,
+                options,
+                list(state.services.get("unity_resource_files", [])),
+            )
             resource = resolution.path
             streaming_info.update(
                 {
@@ -856,10 +1135,6 @@ def _process_unity_serialized_file(
             skipped = obj_item | {"reason": "blocked_unity_object_budget"}
             _record_skipped(state.writer, state.summary, state.skipped_sample, skipped)
             continue
-        if not _can_write_bytes(state.summary, options, obj.size):
-            skipped = obj_item | {"reason": "blocked_output_budget"}
-            _record_skipped(state.writer, state.summary, state.skipped_sample, skipped)
-            continue
         state.summary["planned_output_bytes"] = int(state.summary["planned_output_bytes"]) + obj.size
         if output_dir is None:
             continue
@@ -870,9 +1145,16 @@ def _process_unity_serialized_file(
             hash_output=options.hash_policy != "never",
             chunk_size=options.stream_chunk_size,
             max_object_bytes=options.unity_max_object_bytes,
+            max_output_bytes=(
+                None
+                if options.max_output_bytes is None
+                else max(0, options.max_output_bytes - int(state.summary["output_bytes"]))
+            ),
             extract_raw_objects=options.unity_extract_raw_objects or options.mode == "full",
             decode_media=options.unity_decode_media,
         )
+        actual_planned = int(record.get("planned_output_bytes", record.get("output_bytes", record.get("length", obj.size))))
+        state.summary["planned_output_bytes"] = int(state.summary["planned_output_bytes"]) + actual_planned - obj.size
         if record.get("reconstruction_status") == "blocked_budget":
             _record_skipped(state.writer, state.summary, state.skipped_sample, record)
             continue
@@ -1020,15 +1302,17 @@ def maybe_extract_embedded_candidate(
     if not _can_write_bytes(state.summary, options, candidate.length):
         _record_skipped(state.writer, state.summary, state.skipped_sample, candidate_item | {"reason": "blocked_output_budget"})
         return
-    detector = _detector_for_type(candidate.detected_type, registry)
-    extension = detector.extension if detector is not None else f".{candidate.detected_type}"
+    extension = _extension_for_type(candidate.detected_type, registry)
+    content_hash = ""
+    if options.naming == "hash":
+        content_hash = sha256_range(file_path, candidate.offset, candidate.length, options.stream_chunk_size)
     relative = _asset_name(
         file_path,
         input_path,
         candidate.detected_type,
         extension,
         candidate.offset,
-        b"",
+        content_hash,
         int(state.summary["extracted_total"]),
         options,
     )
@@ -1059,6 +1343,248 @@ def maybe_extract_embedded_candidate(
             "decompile_value": candidate.decompile_value,
         },
     )
+
+
+def maybe_extract_embedded_source_candidate(
+    input_path: Path,
+    logical_path: Path,
+    source: ArtifactSource,
+    output_dir: Path | None,
+    candidate: EmbeddedCandidate,
+    state: RunState,
+    options: ExtractionOptions,
+    registry: CapabilityRegistry,
+) -> None:
+    candidate_item = _candidate_item(candidate) | {"logical_path": str(logical_path)}
+    state.writer.candidate(candidate_item)
+    _sample_append(state.candidates_sample, candidate_item)
+    if not should_extract_category(candidate.category, options.mode, options.include_categories, options.exclude_categories):
+        return
+    if not candidate.extractable or candidate.length is None:
+        _record_skipped(
+            state.writer,
+            state.summary,
+            state.skipped_sample,
+            candidate_item | {"reason": candidate.reason or "found_not_extracted"},
+        )
+        return
+    state.summary["planned_output_bytes"] = int(state.summary["planned_output_bytes"]) + candidate.length
+    if output_dir is None:
+        return
+    if not _can_write_bytes(state.summary, options, candidate.length):
+        _record_skipped(state.writer, state.summary, state.skipped_sample, candidate_item | {"reason": "blocked_output_budget"})
+        return
+    extension = _extension_for_type(candidate.detected_type, registry)
+    content_hash = (
+        sha256_artifact_range(source, candidate.offset, candidate.length)
+        if options.naming == "hash"
+        else ""
+    )
+    relative = _asset_name(
+        logical_path,
+        input_path,
+        candidate.detected_type,
+        extension,
+        candidate.offset,
+        content_hash,
+        int(state.summary["extracted_total"]),
+        options,
+    )
+    destination = output_dir / relative
+    if destination.exists() and not options.overwrite:
+        destination = ensure_unique(destination)
+    digest = copy_artifact_range(
+        source,
+        destination,
+        candidate.offset,
+        candidate.length,
+        hash_output=options.hash_policy != "never",
+    )
+    _record_extracted(
+        state.writer,
+        state.summary,
+        state.extracted_sample,
+        {
+            "output_path": str(destination),
+            "type": candidate.detected_type,
+            "source_path": str(logical_path),
+            "source_offset": candidate.offset,
+            "length": candidate.length,
+            "sha256": digest,
+            "validation_status": "range_valid",
+            "category": candidate.category,
+            "decompile_value": candidate.decompile_value,
+        },
+    )
+
+
+def _container_entry_limit_reached(state: RunState, options: ExtractionOptions) -> bool:
+    limit = options.max_container_entries
+    return limit is not None and int(state.summary["container_entries_total"]) >= limit
+
+
+def _logical_container_entry_path(container_path: Path, entry_name: str) -> Path:
+    return container_path.parent / f"{container_path.stem}.contents" / Path(*Path(entry_name).parts)
+
+
+def process_container_entry_artifact(
+    input_path: Path,
+    container_path: Path,
+    physical_container_path: Path,
+    entry: object,
+    handler: object,
+    output_dir: Path | None,
+    state: RunState,
+    options: ExtractionOptions,
+    registry: CapabilityRegistry,
+    depth: int,
+) -> None:
+    source = source_for_container_entry(handler, physical_container_path, entry, options.stream_chunk_size)
+    if source is None:
+        state.warnings.append(f"{container_path}:{entry.name}: container_entry_source_unavailable")
+        return
+    logical_path = _logical_container_entry_path(container_path, entry.name)
+    try:
+        probe = probe_artifact_source(source, logical_path, options, registry)
+    except Exception as exc:
+        _record_failure(state, container_path, f"artifact_probe_failed:{exc}", entry.name)
+        return
+    artifact_item = _probe_file_item(probe) | {
+        "stream": "container_artifact",
+        "container_path": str(container_path),
+        "entry_name": entry.name,
+        "depth": depth,
+    }
+    state.warnings.extend(f"{logical_path}: {warning}" for warning in probe.warnings)
+    _record_capability_event(state, artifact_item)
+    state.summary["embedded_candidates_total"] = int(state.summary["embedded_candidates_total"]) + len(probe.embedded_candidates)
+    state.summary["embedded_extractable_total"] = int(state.summary["embedded_extractable_total"]) + sum(
+        1 for candidate in probe.embedded_candidates if candidate.extractable
+    )
+    context = _capability_context(
+        root=input_path,
+        file_path=logical_path,
+        output_dir=output_dir,
+        identified_type=probe.identified_type,
+        category=probe.category,
+        decompile_value=probe.decompile_value,
+        parse_info=probe.parse_info,
+        state=state,
+        options=options,
+        registry=registry,
+        probe=probe,
+        depth=depth,
+        source=source,
+    )
+    _run_registered_processors(
+        "converter",
+        registry.matching_converters(logical_path, probe.identified_type, probe.category),
+        context,
+        state,
+    )
+    _run_registered_processors(
+        "reconstructor",
+        registry.matching_reconstructors(logical_path, probe.identified_type, probe.category),
+        context,
+        state,
+    )
+    for candidate in probe.embedded_candidates:
+        if _deadline_exceeded(state):
+            break
+        maybe_extract_embedded_source_candidate(
+            input_path,
+            logical_path,
+            source,
+            output_dir,
+            candidate,
+            state,
+            options,
+            registry,
+        )
+    if depth >= options.max_container_depth or source.size > options.max_in_memory_bytes:
+        return
+    try:
+        with source.materialized(logical_path.suffix) as materialized_path:
+            nested_handler = registry.find_container_handler(materialized_path, options.container_deep_scan)
+            if nested_handler is not None:
+                process_nested_container(
+                    input_path,
+                    logical_path,
+                    materialized_path,
+                    output_dir,
+                    nested_handler,
+                    state,
+                    options,
+                    registry,
+                    depth + 1,
+                )
+    except Exception as exc:
+        _record_failure(state, container_path, f"nested_container_failed:{exc}", entry.name)
+
+
+def process_nested_container(
+    input_path: Path,
+    logical_path: Path,
+    materialized_path: Path,
+    output_dir: Path | None,
+    handler: object,
+    state: RunState,
+    options: ExtractionOptions,
+    registry: CapabilityRegistry,
+    depth: int,
+) -> None:
+    opened = handler.open(materialized_path)
+    state.summary["containers_total"] = int(state.summary["containers_total"]) + 1
+    _record_capability_event(
+        state,
+        {
+            "stream": "nested_container",
+            "path": str(logical_path),
+            "container_type": handler.type_name,
+            "depth": depth,
+            "container": opened.info.to_dict(),
+        }
+    )
+    relative = safe_relative_path(logical_path, input_path if input_path.is_dir() else input_path.parent)
+    container_output = output_dir / "containers" / relative.parent / logical_path.stem if output_dir else None
+    for nested_entry in opened.iter_entries():
+        if _deadline_exceeded(state):
+            break
+        if _container_entry_limit_reached(state, options):
+            state.warnings.append(f"container_entry_limit_reached:{options.max_container_entries}")
+            break
+        state.summary["container_entries_total"] = int(state.summary["container_entries_total"]) + 1
+        state.summary["deep_container_entries_total"] = int(state.summary["deep_container_entries_total"]) + 1
+        state.summary["embedded_candidates_total"] = int(state.summary["embedded_candidates_total"]) + 1
+        state.summary["embedded_extractable_total"] = int(state.summary["embedded_extractable_total"]) + 1
+        entry_item = nested_entry.to_dict() | {
+            "source_container": str(logical_path),
+            "container_type": handler.type_name,
+            "depth": depth,
+        }
+        state.writer.container_entry(entry_item)
+        maybe_extract_container_entry(
+            materialized_path,
+            nested_entry,
+            handler,
+            container_output,
+            state,
+            options,
+            registry,
+            source_display_path=logical_path,
+        )
+        process_container_entry_artifact(
+            input_path,
+            logical_path,
+            materialized_path,
+            nested_entry,
+            handler,
+            output_dir,
+            state,
+            options,
+            registry,
+            depth,
+        )
 
 
 def process_container(
@@ -1093,34 +1619,55 @@ def process_container(
     _bump(state.summary["by_type"], handler.type_name)
     _bump(state.summary["by_category"], classification["category"])
     _bump(state.summary["by_decompile_value"], classification["decompile_value"])
-    _record_semantic_conversion(
+    context = _capability_context(
+        root=input_path,
+        file_path=file_path,
+        output_dir=output_dir,
+        identified_type=handler.type_name,
+        category=classification["category"],
+        decompile_value=classification["decompile_value"],
+        parse_info=file_item["parse_info"],
+        state=state,
+        options=options,
+        registry=registry,
+    )
+    _run_registered_processors(
+        "converter",
+        registry.matching_converters(file_path, handler.type_name, classification["category"]),
+        context,
         state,
-        build_semantic_conversion(
-            input_path,
-            file_path,
-            output_dir,
-            file_path.suffix.lower(),
-            handler.type_name,
-            classification["category"],
-            file_item["parse_info"],
-            options.mode,
-            options.overwrite,
-        ),
     )
 
     entries = opened.iter_entries()
-    state.summary["container_entries_total"] = int(state.summary["container_entries_total"]) + len(entries)
-    state.summary["deep_container_entries_total"] = int(state.summary["deep_container_entries_total"]) + len(entries)
-    state.summary["embedded_candidates_total"] = int(state.summary["embedded_candidates_total"]) + len(entries)
-    state.summary["embedded_extractable_total"] = int(state.summary["embedded_extractable_total"]) + len(entries)
     container_output = _output_base_for_container(input_path, file_path, output_dir) if output_dir else None
     for entry in entries:
+        if _deadline_exceeded(state):
+            break
+        if _container_entry_limit_reached(state, options):
+            state.warnings.append(f"container_entry_limit_reached:{options.max_container_entries}")
+            break
+        state.summary["container_entries_total"] = int(state.summary["container_entries_total"]) + 1
+        state.summary["deep_container_entries_total"] = int(state.summary["deep_container_entries_total"]) + 1
+        state.summary["embedded_candidates_total"] = int(state.summary["embedded_candidates_total"]) + 1
+        state.summary["embedded_extractable_total"] = int(state.summary["embedded_extractable_total"]) + 1
         entry_item = entry.to_dict() | {"container_type": handler.type_name}
         state.writer.container_entry(entry_item)
         if handler.type_name in {"unreal_pak", "utoc"}:
             state.writer.unreal_entry(entry_item)
             state.summary["unreal_entries_total"] = int(state.summary["unreal_entries_total"]) + 1
         maybe_extract_container_entry(file_path, entry, handler, container_output, state, options, registry)
+        process_container_entry_artifact(
+            input_path,
+            file_path,
+            file_path,
+            entry,
+            handler,
+            output_dir,
+            state,
+            options,
+            registry,
+            1,
+        )
 
 
 def process_regular_file(
@@ -1145,25 +1692,59 @@ def process_regular_file(
         1 for candidate in probe.embedded_candidates if candidate.extractable
     )
     state.warnings.extend(f"{file_path}: {warning}" for warning in probe.warnings)
-    _record_semantic_conversion(
-        state,
-        build_semantic_conversion(
-            input_path,
-            file_path,
-            output_dir,
-            probe.extension,
-            probe.identified_type,
-            probe.category,
-            probe.parse_info,
-            options.mode,
-            options.overwrite,
-        ),
+    context = _capability_context(
+        root=input_path,
+        file_path=file_path,
+        output_dir=output_dir,
+        identified_type=probe.identified_type,
+        category=probe.category,
+        decompile_value=probe.decompile_value,
+        parse_info=probe.parse_info,
+        state=state,
+        options=options,
+        registry=registry,
+        probe=probe,
     )
-    process_unity_artifacts(file_path, output_dir, probe, state, options, registry)
-    process_assembly_artifacts(file_path, probe, state)
+    _run_registered_processors(
+        "converter",
+        registry.matching_converters(file_path, probe.identified_type, probe.category),
+        context,
+        state,
+    )
+    _run_registered_processors(
+        "reconstructor",
+        registry.matching_reconstructors(file_path, probe.identified_type, probe.category),
+        context,
+        state,
+    )
     maybe_extract_direct_file(input_path, file_path, output_dir, probe, file_item, state, options, registry, direct_extract_known_only)
     for candidate in probe.embedded_candidates:
+        if _deadline_exceeded(state):
+            break
         maybe_extract_embedded_candidate(input_path, file_path, output_dir, candidate, state, options, registry)
+
+
+def process_size_limited_file(
+    file_path: Path,
+    state: RunState,
+    options: ExtractionOptions,
+    registry: CapabilityRegistry,
+) -> None:
+    probe = probe_file(file_path, options, registry)
+    file_item = _probe_file_item(probe)
+    state.writer.file(file_item)
+    _sample_append(state.files_sample, file_item)
+    state.summary["files_total"] = int(state.summary["files_total"]) + 1
+    _bump(state.summary["by_type"], probe.identified_type)
+    _bump(state.summary["by_category"], probe.category)
+    _bump(state.summary["by_decompile_value"], probe.decompile_value)
+    state.warnings.extend(f"{file_path}: {warning}" for warning in probe.warnings)
+    _record_skipped(
+        state.writer,
+        state.summary,
+        state.skipped_sample,
+        file_item | {"reason": "blocked_file_size_limit"},
+    )
 
 
 def _excluded_outputs(input_path: Path, output_dir: Path | None) -> list[Path]:
@@ -1178,39 +1759,66 @@ def _run_decompilation(
     options: ExtractionOptions,
     direct_extract_known_only: bool = False,
 ) -> DecompilationReport:
+    if input_path.is_dir() and output_dir is not None and input_path.resolve() == output_dir.resolve(strict=False):
+        raise ValueError("output directory must not be the same directory as the input root")
     started_at = _now()
     registry = _registry_for_options(options)
     with JsonlManifestWriter(output_dir) as writer:
-        state = RunState(writer=writer)
+        state = RunState(
+            writer=writer,
+            deadline=(monotonic() + options.max_processing_seconds if options.max_processing_seconds is not None else None),
+        )
         with use_registry(registry):
             state.warnings.extend(f"capability_registry: {warning}" for warning in registry.load_errors)
-            discovered = _discover(
-                input_path,
-                options.recursive,
-                _excluded_outputs(input_path, output_dir),
-                sort_paths=options.sort_paths,
-            )
-            if options.unity_object_scan:
-                discovered_files: Iterable[Path] = list(discovered)
-                state.unity_resource_files = [path for path in discovered_files if _is_unity_resource_path(path)]
-                state.unity_index.build(discovered_files)
-                state.summary["unity_indexed_files_total"] = state.unity_index.indexed_files_total
-                state.summary["unity_indexed_objects_total"] = state.unity_index.indexed_objects_total
-                state.warnings.extend(
-                    f"{path}: unity_index_parse_error:{reason}"
-                    for path, reason in sorted(state.unity_index.parse_errors.items())
+            excluded_outputs = _excluded_outputs(input_path, output_dir)
+
+            def discover() -> Iterable[Path]:
+                return _discover(
+                    input_path,
+                    options.recursive,
+                    excluded_outputs,
+                    sort_paths=options.sort_paths,
                 )
-            else:
-                discovered_files = discovered
-            for file_path in discovered_files:
+
+            run_context = RunContext(
+                input_path=input_path,
+                output_dir=output_dir,
+                options=options,
+                registry=registry,
+                summary=state.summary,
+                warnings=state.warnings,
+                services=state.services,
+                discover=discover,
+            )
+            state.services["deadline_exceeded"] = lambda: _deadline_exceeded(state)
+            for hook in registry.run_hooks:
+                if _deadline_exceeded(state):
+                    break
                 try:
+                    hook.hook(run_context)
+                except Exception as exc:
+                    registry.record_runtime_error(hook, input_path, exc)
+                    state.warnings.append(f"run_hook_failed:{hook.capability_id}:{exc}")
+            for file_path in discover():
+                if _deadline_exceeded(state):
+                    break
+                try:
+                    if (
+                        options.max_file_size_mb is not None
+                        and file_path.stat().st_size > options.max_file_size_mb * 1024 * 1024
+                    ):
+                        process_size_limited_file(file_path, state, options, registry)
+                        continue
                     handler = registry.find_container_handler(file_path, options.container_deep_scan)
                     if handler is not None:
                         process_container(input_path, file_path, output_dir, handler, state, options, registry)
                     else:
                         process_regular_file(input_path, file_path, output_dir, state, options, registry, direct_extract_known_only)
-                except (OSError, ValueError) as exc:
+                except Exception as exc:
                     _record_failure(state, file_path, str(exc))
+                state.warnings.extend(
+                    f"capability_runtime: {warning}" for warning in registry.drain_runtime_errors()
+                )
 
         finished_at = _now()
         payload = {
@@ -1279,13 +1887,15 @@ def _asset_name(
     type_name: str,
     extension: str,
     offset: int,
-    data: bytes,
+    content_hash: str,
     index: int,
     options: ExtractionOptions,
 ) -> Path:
     suffix = extension if extension.startswith(".") else f".{extension}"
     if options.naming == "hash":
-        name = f"{type_name}_{sha256_bytes(data)[:16]}{suffix}"
+        if not content_hash:
+            raise ValueError("hash naming requires a content hash")
+        name = f"{type_name}_{content_hash[:16]}{suffix}"
     elif options.naming == "type_index":
         name = f"{type_name}_{index:04d}{suffix}"
     else:
@@ -1362,5 +1972,5 @@ def extract_path(
         failed=report.failed_sample,
         skipped=report.skipped_sample,
     )
-    (out / "deinserter-manifest.json").write_text(json.dumps(legacy_report.to_dict(), indent=2), encoding="utf-8")
+    write_text_atomic(out / "deinserter-manifest.json", json.dumps(legacy_report.to_dict(), indent=2))
     return legacy_report

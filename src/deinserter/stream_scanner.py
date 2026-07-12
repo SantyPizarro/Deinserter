@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import struct
+from typing import Callable
 
 from .classification import classify_asset
 from .models import EmbeddedCandidate, ScanOptions
-from .resources import ByteSource
+from .resources import ArtifactSource, ByteSource
+from .registry import CapabilityRegistry, StreamingDetectorCapability
 
 SIGNATURES: dict[str, bytes] = {
     "png": b"\x89PNG\r\n\x1a\n",
@@ -530,9 +532,41 @@ def _length_for(source: ByteSource, offset: int, detected_type: str) -> tuple[in
     return None, "unsupported_streaming_signature"
 
 
-def scan_embedded_streaming(path: str, options: ScanOptions) -> list[EmbeddedCandidate]:
-    source = ByteSource(path, options.stream_chunk_size)
-    overlap_size = max(len(signature) for signature in SIGNATURES.values()) - 1
+def register_builtin_streaming_detectors(registry: CapabilityRegistry) -> None:
+    for detected_type, signature in SIGNATURES.items():
+        candidate_type = "mo" if detected_type == "mo_be" else detected_type
+
+        def length_reader(source: ArtifactSource, offset: int, _signature: bytes, kind: str = detected_type):
+            return _length_for(source, offset, kind)
+
+        registry.add_streaming_detector(
+            type_name=candidate_type,
+            signatures=(signature,),
+            length_reader=length_reader,
+            extension=".jpg" if candidate_type == "jpg" else f".{candidate_type}",
+            capability_id=f"builtin:streaming_detector:{detected_type}",
+        )
+
+
+def scan_embedded_streaming(
+    path: str | ArtifactSource,
+    options: ScanOptions,
+    detectors: tuple[StreamingDetectorCapability, ...] | list[StreamingDetectorCapability] | None = None,
+    on_error: Callable[[StreamingDetectorCapability, Exception], None] | None = None,
+) -> list[EmbeddedCandidate]:
+    if isinstance(path, ArtifactSource):
+        source = path
+        source_file = str(path.source_path or path.name)
+    else:
+        source = ArtifactSource.from_path(path, chunk_size=options.stream_chunk_size)
+        source_file = path
+    capabilities = tuple(detectors or ())
+    if not capabilities:
+        temporary_registry = CapabilityRegistry()
+        with temporary_registry.registration_source("builtin"):
+            register_builtin_streaming_detectors(temporary_registry)
+        capabilities = temporary_registry.streaming_detectors
+    overlap_size = max(len(signature) for detector in capabilities for signature in detector.signatures) - 1
     candidates: list[EmbeddedCandidate] = []
     seen: set[tuple[str, int]] = set()
     overlap = b""
@@ -540,20 +574,33 @@ def scan_embedded_streaming(path: str, options: ScanOptions) -> list[EmbeddedCan
     for chunk_offset, chunk in source.iter_chunks():
         data = overlap + chunk
         base_offset = chunk_offset - len(overlap)
-        for detected_type, signature in SIGNATURES.items():
-            candidate_type = "mo" if detected_type == "mo_be" else detected_type
-            start = 0
-            while True:
-                found = data.find(signature, start)
-                if found == -1:
-                    break
-                absolute = base_offset + found
-                key = (candidate_type, absolute)
-                if absolute >= 0 and key not in seen:
-                    seen.add(key)
-                    length, reason = _length_for(source, absolute, detected_type)
-                    confidence = 0.9 if length is not None else 0.55
-                    candidates.append(_candidate(path, absolute, length, confidence, candidate_type, reason))
-                start = found + 1
+        for detector in capabilities:
+            for signature in detector.signatures:
+                start = 0
+                while True:
+                    found = data.find(signature, start)
+                    if found == -1:
+                        break
+                    absolute = base_offset + found
+                    key = (detector.type_name, absolute)
+                    if absolute >= 0 and key not in seen:
+                        try:
+                            result = detector.length_reader(source, absolute, signature)
+                        except Exception as exc:
+                            if on_error is not None:
+                                on_error(detector, exc)
+                            start = found + 1
+                            continue
+                        seen.add(key)
+                        if isinstance(result, tuple):
+                            length, reason = result
+                        else:
+                            length = result
+                            reason = "" if length is not None else "streaming_length_untrusted"
+                        confidence = 0.9 if length is not None else 0.55
+                        candidates.append(_candidate(source_file, absolute, length, confidence, detector.type_name, reason))
+                        if options.max_embedded_candidates is not None and len(candidates) >= options.max_embedded_candidates:
+                            return candidates
+                    start = found + 1
         overlap = data[-overlap_size:] if overlap_size else b""
     return candidates

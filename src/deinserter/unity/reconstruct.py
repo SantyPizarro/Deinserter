@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ..resources import copy_range_streaming
+from ..resources import copy_range_streaming, sha256_range, write_bytes_atomic
 from ..utils import ensure_unique
 from .serialized import UnityObject
 
@@ -122,23 +122,12 @@ def _payload_kind(data: bytes, obj: UnityObject) -> tuple[str, str]:
 
 def _copy_raw_payload(
     obj: UnityObject,
-    target_dir: Path,
-    stem: str,
-    extension: str,
-    overwrite: bool,
+    output_path: Path,
     hash_output: bool,
     chunk_size: int,
-) -> tuple[Path, str]:
+) -> str:
     source = Path(obj.source_path)
-    output_path = target_dir / f"{stem}{extension}"
-    if output_path.exists() and not overwrite:
-        output_path = ensure_unique(output_path)
-    sha256 = copy_range_streaming(source, output_path, obj.offset, obj.size, chunk_size, hash_output)
-    return output_path, sha256
-
-
-def _write_json_sidecar(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return copy_range_streaming(source, output_path, obj.offset, obj.size, chunk_size, hash_output)
 
 
 def _texture_semantic(obj: UnityObject) -> dict[str, Any]:
@@ -190,7 +179,7 @@ def _vertex_triplet(value: Any) -> tuple[float, float, float] | None:
     return None
 
 
-def _export_obj(vertices: list[Any], indices: list[Any], target_dir: Path, stem: str, overwrite: bool) -> Path | None:
+def _export_obj(vertices: list[Any], indices: list[Any], target_dir: Path, stem: str, overwrite: bool) -> tuple[Path, bytes] | None:
     parsed_vertices = [_vertex_triplet(item) for item in vertices]
     if not parsed_vertices or any(item is None for item in parsed_vertices):
         return None
@@ -212,11 +201,16 @@ def _export_obj(vertices: list[Any], indices: list[Any], target_dir: Path, stem:
         if min(a, b, c) < 0 or max(a, b, c) >= len(parsed_vertices):
             return None
         lines.append(f"f {a + 1} {b + 1} {c + 1}")
-    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return output_path
+    return output_path, ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def _mesh_semantic(obj: UnityObject, target_dir: Path, stem: str, overwrite: bool) -> dict[str, Any]:
+def _mesh_semantic(
+    obj: UnityObject,
+    target_dir: Path,
+    stem: str,
+    overwrite: bool,
+    pending_outputs: list[tuple[Path, bytes]],
+) -> dict[str, Any]:
     semantic = _semantic_base(obj)
     fields = obj.decoded_fields
     vertices, indices = _mesh_values(obj)
@@ -228,8 +222,10 @@ def _mesh_semantic(obj: UnityObject, target_dir: Path, stem: str, overwrite: boo
         "normals": _field(fields, "m_Normals", "normals"),
         "uvs": _field(fields, "m_UV", "uv", "uvs"),
     }
-    obj_path = _export_obj(vertices, indices, target_dir, stem, overwrite)
-    if obj_path is not None:
+    obj_export = _export_obj(vertices, indices, target_dir, stem, overwrite)
+    if obj_export is not None:
+        obj_path, obj_payload = obj_export
+        pending_outputs.append((obj_path, obj_payload))
         semantic["exported_files"].append({"kind": "obj", "output_path": str(obj_path)})
     elif vertices:
         semantic["semantic_status"] = "partial"
@@ -261,13 +257,19 @@ def _mono_behaviour_semantic(obj: UnityObject) -> dict[str, Any]:
     return semantic
 
 
-def _semantic_for_object(obj: UnityObject, target_dir: Path, stem: str, overwrite: bool) -> dict[str, Any]:
+def _semantic_for_object(
+    obj: UnityObject,
+    target_dir: Path,
+    stem: str,
+    overwrite: bool,
+    pending_outputs: list[tuple[Path, bytes]],
+) -> dict[str, Any]:
     if obj.class_id == 28:
         return _texture_semantic(obj)
     if obj.class_id == 83:
         return _audio_semantic(obj)
     if obj.class_id == 43:
-        return _mesh_semantic(obj, target_dir, stem, overwrite)
+        return _mesh_semantic(obj, target_dir, stem, overwrite, pending_outputs)
     if obj.class_id == 21:
         return _material_semantic(obj)
     if obj.class_id == 114:
@@ -283,6 +285,7 @@ def reconstruct_unity_object(
     hash_output: bool = True,
     chunk_size: int = 8 * 1024 * 1024,
     max_object_bytes: int | None = None,
+    max_output_bytes: int | None = None,
     extract_raw_objects: bool = False,
     decode_media: bool = False,
 ) -> dict[str, Any]:
@@ -308,7 +311,8 @@ def reconstruct_unity_object(
         handle.seek(obj.offset)
         preview = handle.read(min(obj.size, 4096))
     extension, payload_status = _payload_kind(preview, obj)
-    semantic = _semantic_for_object(obj, target_dir, stem, overwrite)
+    pending_outputs: list[tuple[Path, bytes]] = []
+    semantic = _semantic_for_object(obj, target_dir, stem, overwrite, pending_outputs)
     external_outputs = _external_outputs(obj)
     semantic["external_outputs"] = external_outputs
     semantic["raw_payload"] = {
@@ -328,7 +332,10 @@ def reconstruct_unity_object(
     sha256 = ""
     payload_length = 0
     if should_copy_raw and (payload_status != "metadata_only" or extract_raw_objects):
-        output_path, sha256 = _copy_raw_payload(obj, target_dir, stem, extension, overwrite, hash_output, chunk_size)
+        output_path = target_dir / f"{stem}{extension}"
+        if output_path.exists() and not overwrite:
+            output_path = ensure_unique(output_path)
+        sha256 = sha256_range(source, obj.offset, obj.size, chunk_size) if hash_output else ""
         payload_length = obj.size
         semantic["raw_payload"].update({"copied": True, "output_path": str(output_path), "sha256": sha256})
 
@@ -358,7 +365,26 @@ def reconstruct_unity_object(
         "semantic": semantic,
         "output_path": str(output_path) if output_path is not None else "",
     }
-    _write_json_sidecar(sidecar_path, sidecar)
+    sidecar_payload = json.dumps(sidecar, indent=2, ensure_ascii=False).encode("utf-8")
+    total_output_bytes = payload_length + len(sidecar_payload) + sum(len(payload) for _path, payload in pending_outputs)
+    if max_output_bytes is not None and total_output_bytes > max_output_bytes:
+        return {
+            "source_path": obj.source_path,
+            "path_id": obj.path_id,
+            "class_id": obj.class_id,
+            "type_name": obj.type_name,
+            "source_offset": obj.offset,
+            "length": 0,
+            "reconstruction_status": "blocked_budget",
+            "semantic_status": "blocked_budget",
+            "reason": "blocked_output_budget",
+            "planned_output_bytes": total_output_bytes,
+        }
+    for pending_path, pending_payload in pending_outputs:
+        write_bytes_atomic(pending_path, pending_payload)
+    if payload_length and output_path is not None:
+        _copy_raw_payload(obj, output_path, hash_output, chunk_size)
+    write_bytes_atomic(sidecar_path, sidecar_payload)
     return {
         "output_path": str(output_path or sidecar_path),
         "sidecar_path": str(sidecar_path),
@@ -372,7 +398,9 @@ def reconstruct_unity_object(
         "path_id": obj.path_id,
         "source_path": obj.source_path,
         "source_offset": obj.offset,
-        "length": payload_length,
+        "length": total_output_bytes,
+        "payload_length": payload_length,
+        "output_bytes": total_output_bytes,
         "sha256": sha256,
         "validation_status": "unity_object_range",
         "reconstruction_status": reconstruction_status,
