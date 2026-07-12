@@ -10,6 +10,7 @@ def classify_asset(name: str, detected_type: str = "", registry: object | None =
     ext = Path(normalized).suffix
     filename = Path(normalized).name
     top = normalized.split("/", 1)[0] if normalized else ""
+    folders = {part for part in normalized.split("/")[:-1] if part}
     detected = detected_type.lower()
 
     if registry is None:
@@ -34,23 +35,23 @@ def classify_asset(name: str, detected_type: str = "", registry: object | None =
         category = "scripts"
         role = "source_or_script_text"
         value = "high"
-    elif top == "levels" or ext == ".lvl":
+    elif top == "levels" or "levels" in folders or ext == ".lvl":
         category = "levels"
         role = "map_or_level_data"
         value = "high"
-    elif top == "shaders" or ext in {".shader", ".frag", ".vert", ".glsl", ".hlsl"}:
+    elif top == "shaders" or "shaders" in folders or ext in {".shader", ".frag", ".vert", ".glsl", ".hlsl"}:
         category = "shaders"
         role = "rendering_program_text"
         value = "high"
-    elif top == "data" or ext in {".gon", ".json", ".xml", ".ini", ".cfg", ".txt", ".csv", ".data"}:
+    elif top == "data" or "data" in folders or ext in {".gon", ".json", ".xml", ".ini", ".cfg", ".txt", ".csv", ".data"}:
         category = "data"
         role = "game_data_or_config"
         value = "high"
-    elif top == "audio" or ext in {".wav", ".ogg", ".mid", ".mp3", ".flac", ".aac"}:
+    elif top == "audio" or "audio" in folders or ext in {".wav", ".ogg", ".mid", ".mp3", ".flac", ".aac"}:
         category = "audio"
         role = "soundtrack_or_sfx"
         value = "low"
-    elif top == "textures" or ext in {".png", ".dds", ".ktx", ".jpg", ".jpeg", ".tga", ".bmp", ".webp"}:
+    elif top == "textures" or "textures" in folders or ext in {".png", ".dds", ".ktx", ".jpg", ".jpeg", ".tga", ".bmp", ".webp"}:
         category = "textures"
         role = "image_asset"
         value = "low"

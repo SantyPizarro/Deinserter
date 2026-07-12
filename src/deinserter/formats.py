@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Any
 
 try:  # Python 3.11+
@@ -35,6 +36,8 @@ def normalize_extension(extension: str) -> str:
 
 
 def format_spec_from_mapping(item: dict[str, Any], source: str = "") -> FormatSpec:
+    if not isinstance(item, dict):
+        raise ValueError(f"{source}: each format must be a table")
     required = ("type_name", "extensions", "category", "role", "decompile_value")
     missing = [key for key in required if key not in item]
     if missing:
@@ -42,21 +45,33 @@ def format_spec_from_mapping(item: dict[str, Any], source: str = "") -> FormatSp
         raise ValueError(f"{prefix}format is missing required field(s): {', '.join(missing)}")
 
     type_name = str(item["type_name"]).strip().lower()
-    if not type_name:
-        raise ValueError(f"{source}: type_name cannot be empty")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", type_name):
+        raise ValueError(f"{source}: type_name must be a stable lowercase identifier")
 
     raw_extensions = item["extensions"]
-    if not isinstance(raw_extensions, list) or not raw_extensions:
+    if not isinstance(raw_extensions, list) or not raw_extensions or not all(isinstance(item, str) for item in raw_extensions):
         raise ValueError(f"{source}: extensions must be a non-empty list")
 
-    extensions = tuple(dict.fromkeys(normalize_extension(str(extension)) for extension in raw_extensions))
+    extensions = tuple(dict.fromkeys(normalize_extension(extension) for extension in raw_extensions))
+    category = str(item["category"]).strip().lower() or "unknown"
+    role = str(item["role"]).strip().lower() or "unclassified"
+    decompile_value = str(item["decompile_value"]).strip().lower() or "none"
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", category):
+        raise ValueError(f"{source}: category must be a lowercase identifier")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", role):
+        raise ValueError(f"{source}: role must be a lowercase identifier")
+    if decompile_value not in {"none", "low", "medium", "high"}:
+        raise ValueError(f"{source}: decompile_value must be one of none, low, medium, high")
+    raw_text = item.get("text", False)
+    if not isinstance(raw_text, bool):
+        raise ValueError(f"{source}: text must be a boolean")
     return FormatSpec(
         type_name=type_name,
         extensions=extensions,
-        category=str(item["category"]).strip() or "unknown",
-        role=str(item["role"]).strip() or "unclassified",
-        decompile_value=str(item["decompile_value"]).strip() or "none",
-        text=bool(item.get("text", False)),
+        category=category,
+        role=role,
+        decompile_value=decompile_value,
+        text=raw_text,
     )
 
 
@@ -64,10 +79,22 @@ def load_format_specs_from_mapping(data: dict[str, Any], source: str = "") -> tu
     raw_formats = data.get("formats", [])
     if not isinstance(raw_formats, list):
         raise ValueError(f"{source}: formats must be a list")
-    return tuple(
+    specs = tuple(
         format_spec_from_mapping(item, f"{source}#formats[{index}]" if source else f"formats[{index}]")
         for index, item in enumerate(raw_formats)
     )
+    seen_types: set[str] = set()
+    seen_extensions: dict[str, str] = {}
+    for spec in specs:
+        if spec.type_name in seen_types:
+            raise ValueError(f"{source}: duplicate format type_name: {spec.type_name}")
+        seen_types.add(spec.type_name)
+        for extension in spec.extensions:
+            previous = seen_extensions.get(extension)
+            if previous is not None and previous != spec.type_name:
+                raise ValueError(f"{source}: extension {extension} is assigned to both {previous} and {spec.type_name}")
+            seen_extensions[extension] = spec.type_name
+    return specs
 
 
 def load_format_specs(path: str | Path) -> tuple[FormatSpec, ...]:

@@ -43,7 +43,25 @@ Register it from a plugin:
 
 ```python
 def register(registry):
-    registry.add_detector(MyDetector())
+    registry.add_detector(
+        MyDetector(),
+        capability_id="my_pack:detector:dialogue",
+        priority=100,
+    )
+```
+
+For embedded scanning above `max_in_memory_bytes`, register a streaming signature
+whose length reader works against a bounded `ArtifactSource`:
+
+```python
+registry.add_streaming_detector(
+    type_name="dialogue",
+    signatures=(b"DLG0",),
+    length_reader=dialogue_length,
+    extension=".dialogue",
+    capability_id="my_pack:streaming:dialogue",
+    priority=100,
+)
 ```
 
 ## 3. Add a Container Handler
@@ -68,18 +86,46 @@ clues.
 
 ```python
 def register(registry):
-    registry.add_parser(
+    registry.add_source_parser(
         parse_dialogue,
         name="dialogue",
+        capability_id="my_pack:parser:dialogue",
         type_names={"dialogue"},
         extensions={".dialogue"},
+        priority=100,
     )
 ```
+
+Source parsers work for files, bounded ranges, compressed entries, and nested
+containers. Existing path parsers remain supported with `add_parser`. Mark a path
+parser `stream_safe=True` only when its implementation performs bounded/range
+reads; otherwise it is skipped above `max_in_memory_bytes`.
 
 ## 5. Add a Converter or Reconstructor
 
 Converters should be deterministic and explicit about limits. If a result is
 heuristic, call it pseudocode or metadata rather than source.
+
+Register converters and reconstructors instead of editing the main pipeline.
+They receive a `CapabilityContext` containing the logical path, bounded source,
+options, registry, and budget helpers. Use `context.can_write(size)` before an
+output and `context.emit("output", {"output_length": size})` after committing it.
+
+Use run hooks only for bounded project-wide preparation such as reference indexes.
+Hooks receive a repeatable `discover()` iterator and shared run services.
+
+## Plugin Contract
+
+Declare `DEINSERTER_API_VERSION = CAPABILITY_API_VERSION`. IDs must be stable and
+namespaced. Higher priorities run first; duplicate IDs require explicit
+`replace=True`. Registration is transactional and runtime exceptions are isolated
+to the capability that raised them.
+
+```powershell
+deinserter plugin init ./my-pack --template full
+deinserter plugin validate ./my-pack --json
+deinserter plugin test ./my-pack ./sample.dialogue --expected-type dialogue --json
+```
 
 ## Testing Expectations
 
@@ -90,6 +136,10 @@ Use tiny synthetic fixtures whenever possible. A good contribution proves:
 - parse info is useful and stable;
 - extraction either succeeds with verified bounds or is skipped with a reason;
 - unknown files continue to be reported rather than failing the run.
+- source and streaming paths behave consistently across the memory threshold;
+- nested containers obey depth, entry, candidate, file-size, cooperative time, and output limits;
+- malicious archive paths cannot leave the output root;
+- plugin exceptions do not stop unrelated files or capabilities.
 
 Run:
 
@@ -102,3 +152,8 @@ python -m unittest
 Do not add key discovery, DRM bypasses, or speculative decryptors. Deinserter can
 use user-provided keys for formats that explicitly support them in the future,
 but it should not attempt to recover secrets.
+
+Every destination must resolve beneath its assigned output root. Use the atomic
+resource helpers instead of truncating output files directly, and reject aliases
+between an input and destination. A keyring is delivered only to handlers that
+implement `configure(options)`; otherwise the run reports it as unused.

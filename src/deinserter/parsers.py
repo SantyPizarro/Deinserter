@@ -716,33 +716,35 @@ def register_builtin_parsers(registry: object) -> None:
         type_names={"assets"},
         extensions={".assets"},
         file_names={"globalgamemanagers", "unity default resources"},
+        stream_safe=True,
     )
-    registry.add_parser(parse_unity_bundle, name="unity_bundle", type_names={"bundle"}, extensions={".bundle"})
-    registry.add_parser(parse_unity_resource, name="unity_resource", type_names={"resource"}, extensions={".resource", ".ress"})
-    registry.add_parser(parse_jpeg, name="jpeg", type_names={"jpg"}, extensions={".jpg", ".jpeg"})
-    registry.add_parser(parse_dds, name="dds", type_names={"dds"}, extensions={".dds"})
-    registry.add_parser(parse_tga, name="tga", type_names={"tga"}, extensions={".tga"})
-    registry.add_parser(parse_fsb, name="fsb5", type_names={"fsb"}, extensions={".fsb"})
-    registry.add_parser(parse_mo, name="gnu_mo", type_names={"mo"}, extensions={".mo"})
-    registry.add_parser(parse_sfnt, name="sfnt", type_names={"ttf", "otf"}, extensions={".ttf", ".otf"})
-    registry.add_parser(parse_wasm, name="wasm", type_names={"wasm"}, extensions={".wasm"})
-    registry.add_parser(parse_elf, name="elf", type_names={"so"}, extensions={".so"})
-    registry.add_parser(parse_pdb, name="pdb_msf", type_names={"pdb"}, extensions={".pdb"})
-    registry.add_parser(parse_bank, name="wwise_bank", type_names={"bank"}, extensions={".bank"})
+    registry.add_parser(parse_unity_bundle, name="unity_bundle", type_names={"bundle"}, extensions={".bundle"}, stream_safe=True)
+    registry.add_parser(parse_unity_resource, name="unity_resource", type_names={"resource"}, extensions={".resource", ".ress"}, stream_safe=True)
+    registry.add_parser(parse_jpeg, name="jpeg", type_names={"jpg"}, extensions={".jpg", ".jpeg"}, stream_safe=True)
+    registry.add_parser(parse_dds, name="dds", type_names={"dds"}, extensions={".dds"}, stream_safe=True)
+    registry.add_parser(parse_tga, name="tga", type_names={"tga"}, extensions={".tga"}, stream_safe=True)
+    registry.add_parser(parse_fsb, name="fsb5", type_names={"fsb"}, extensions={".fsb"}, stream_safe=True)
+    registry.add_parser(parse_mo, name="gnu_mo", type_names={"mo"}, extensions={".mo"}, stream_safe=True)
+    registry.add_parser(parse_sfnt, name="sfnt", type_names={"ttf", "otf"}, extensions={".ttf", ".otf"}, stream_safe=True)
+    registry.add_parser(parse_wasm, name="wasm", type_names={"wasm"}, extensions={".wasm"}, stream_safe=True)
+    registry.add_parser(parse_elf, name="elf", type_names={"so"}, extensions={".so"}, stream_safe=True)
+    registry.add_parser(parse_pdb, name="pdb_msf", type_names={"pdb"}, extensions={".pdb"}, stream_safe=True)
+    registry.add_parser(parse_bank, name="wwise_bank", type_names={"bank"}, extensions={".bank"}, stream_safe=True)
     registry.add_parser(parse_gltf, name="gltf_json", type_names={"gltf"}, extensions={".gltf"})
     registry.add_parser(parse_obj, name="wavefront_obj", type_names={"obj"}, extensions={".obj"})
-    registry.add_parser(parse_fbx, name="fbx", type_names={"fbx"}, extensions={".fbx"})
+    registry.add_parser(parse_fbx, name="fbx", type_names={"fbx"}, extensions={".fbx"}, stream_safe=True)
     registry.add_parser(parse_shader, name="shader_source", type_names={"hlsl", "glsl"}, extensions={".hlsl", ".glsl", ".frag", ".vert"})
-    registry.add_parser(parse_unreal_package, name="unreal_package", type_names={"uasset", "umap"}, extensions={".uasset", ".umap"})
-    registry.add_parser(parse_rpf, name="rockstar_rpf", type_names={"rpf"}, extensions={".rpf"})
-    registry.add_parser(lambda path: parse_generic_artifact(path, "level_artifact"), name="level_artifact", type_names={"lvl"}, extensions={".lvl"})
+    registry.add_parser(parse_unreal_package, name="unreal_package", type_names={"uasset", "umap"}, extensions={".uasset", ".umap"}, stream_safe=True)
+    registry.add_parser(parse_rpf, name="rockstar_rpf", type_names={"rpf"}, extensions={".rpf"}, stream_safe=True)
+    registry.add_parser(lambda path: parse_generic_artifact(path, "level_artifact"), name="level_artifact", type_names={"lvl"}, extensions={".lvl"}, stream_safe=True)
     registry.add_parser(
         lambda path: parse_generic_artifact(path, "generic_game_data"),
         name="generic_game_data",
         type_names={"sav", "dat"},
         extensions={".sav", ".dat", ".data"},
+        stream_safe=True,
     )
-    registry.add_parser(parse_pe, name="pe", type_names={"dll", "exe"}, extensions={".dll", ".exe"})
+    registry.add_parser(parse_pe, name="pe", type_names={"dll", "exe"}, extensions={".dll", ".exe"}, stream_safe=True)
 
 
 def parse_file(path: str | Path, identified_type: str, category: str = "") -> dict[str, Any]:

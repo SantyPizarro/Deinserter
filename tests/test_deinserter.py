@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import io
 import lzma
 import struct
 import tempfile
@@ -11,6 +13,8 @@ from unittest.mock import patch
 
 from deinserter import (
     ExtractionOptions,
+    FileIdentification,
+    FormatSpec,
     ScanOptions,
     build_capability_registry,
     decompile_path,
@@ -24,6 +28,8 @@ from deinserter import (
     scan_path,
     extract_path,
 )
+from deinserter.detectors import ExtensionDetector
+from deinserter.registry import CAPABILITY_API_VERSION, register_plugin_callable
 import deinserter.unity.bundle as unity_bundle
 from deinserter.unity.bundle import extract_bundle_entry, inspect_bundle
 from deinserter.unity.lz4 import decompress_lz4_block
@@ -901,7 +907,7 @@ class DeinserterTests(unittest.TestCase):
             root = Path(tmp)
             big = root / "huge.bin"
             with big.open("wb") as handle:
-                handle.seek(128 * 1024 * 1024)
+                handle.seek(2 * 1024 * 1024)
                 handle.write(b"\0")
 
             with patch("pathlib.Path.read_bytes", side_effect=AssertionError("read_bytes should not be called")):
@@ -1944,6 +1950,30 @@ class DeinserterTests(unittest.TestCase):
             self.assertEqual(report.summary["skipped_total"], 1)
             self.assertEqual(report.skipped_sample[0]["reason"], "blocked_unity_object_budget")
 
+    def test_global_output_budget_includes_unity_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "out"
+            asset = root / "resources.assets"
+            make_unity_assets_v22_with_object(asset, b"payload")
+
+            report = decompile_path(
+                asset,
+                out,
+                ExtractionOptions(
+                    mode="selective",
+                    max_in_memory_bytes=0,
+                    embedded_scan=False,
+                    max_output_bytes=1,
+                    hash_policy="never",
+                ),
+            )
+
+            self.assertEqual(report.summary["unity_reconstructed_total"], 0)
+            self.assertEqual(report.summary["output_bytes"], 0)
+            self.assertTrue(any(item.get("reason") == "blocked_output_budget" for item in report.skipped_sample))
+            self.assertFalse(any((out / "unity_objects").rglob("*.json")))
+
     def test_assembly_types_jsonl_lists_typedef_and_methods(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2059,6 +2089,678 @@ text = true
             self.assertIn(".quest", registry.format_by_extension)
             self.assertEqual(report.summary["by_type"]["quest"], 1)
             self.assertTrue((out / "main.quest").exists())
+
+    def test_overwrite_never_truncates_the_source_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "source.png"
+            sample.write_bytes(PNG_BYTES)
+
+            report = decompile_path(
+                sample,
+                root,
+                ExtractionOptions(mode="full", overwrite=True, embedded_scan=False, unity_object_scan=False),
+            )
+
+            self.assertEqual(sample.read_bytes(), PNG_BYTES)
+            self.assertEqual(report.summary["failed_total"], 1)
+            failures = list(read_manifest(root).iter_failures())
+            self.assertIn("same", failures[0]["reason"])
+
+    def test_directory_decompile_rejects_identical_output_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "asset.png").write_bytes(PNG_BYTES)
+
+            with self.assertRaisesRegex(ValueError, "same directory"):
+                decompile_path(root, root, ExtractionOptions(mode="full", overwrite=True))
+
+    def test_hash_naming_uses_embedded_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "payload.bin"
+            source.write_bytes(b"prefix" + PNG_BYTES + b"suffix")
+            out = root / "out"
+
+            decompile_path(
+                source,
+                out,
+                ExtractionOptions(
+                    mode="full",
+                    naming="hash",
+                    preserve_paths=False,
+                    unity_object_scan=False,
+                ),
+            )
+
+            expected = hashlib.sha256(PNG_BYTES).hexdigest()[:16]
+            self.assertTrue((out / f"png_{expected}.png").exists())
+
+    def test_invalid_numeric_options_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "stream_chunk_size"):
+            ScanOptions(stream_chunk_size=0)
+        with self.assertRaisesRegex(ValueError, "max_output_bytes"):
+            ExtractionOptions(max_output_bytes=-1)
+        with self.assertRaisesRegex(ValueError, "max_processing_seconds"):
+            ScanOptions(max_processing_seconds=0)
+
+    def test_processing_deadline_stops_run_cooperatively(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for index in range(10):
+                (root / f"asset_{index}.png").write_bytes(PNG_BYTES)
+
+            with patch("deinserter.pipeline.monotonic", side_effect=[0.0] + [1.0] * 100):
+                report = decompile_path(
+                    root,
+                    root / "out",
+                    ExtractionOptions(
+                        mode="manifest_only",
+                        unity_object_scan=False,
+                        max_processing_seconds=0.5,
+                    ),
+                )
+
+            self.assertIn("processing_deadline_reached", report.warnings)
+            self.assertTrue(report.summary["deadline_reached"])
+            self.assertLess(report.summary["files_total"], 10)
+
+    def test_unsafe_archive_paths_never_escape_output_root(self) -> None:
+        from deinserter.containers import _safe_output_path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive_path = root / "unsafe.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("../escaped.txt", "unsafe")
+            out = root / "out"
+
+            report = decompile_path(
+                archive_path,
+                out,
+                ExtractionOptions(mode="full", unity_object_scan=False),
+            )
+
+            self.assertFalse((root / "escaped.txt").exists())
+            self.assertEqual(report.summary["failed_total"], 1)
+            with self.assertRaisesRegex(ValueError, "unsafe absolute archive path"):
+                _safe_output_path(out, "//server/share/escaped.txt", overwrite=False)
+            with self.assertRaisesRegex(ValueError, "unsafe archive path"):
+                _safe_output_path(out, "CON", overwrite=False)
+
+    def test_container_overwrite_never_replaces_its_source_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive_path = root / "self.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("self.zip", b"replacement")
+            original = archive_path.read_bytes()
+
+            report = decompile_path(
+                archive_path,
+                root,
+                ExtractionOptions(mode="full", overwrite=True, unity_object_scan=False),
+            )
+
+            self.assertEqual(archive_path.read_bytes(), original)
+            self.assertGreaterEqual(report.summary["failed_total"], 1)
+
+    def test_semantic_outputs_respect_global_output_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "profile.dat"
+            source.write_bytes(b"binary-profile")
+            out = root / "out"
+
+            report = decompile_path(
+                source,
+                out,
+                ExtractionOptions(
+                    mode="full",
+                    max_output_bytes=1,
+                    embedded_scan=False,
+                    unity_object_scan=False,
+                ),
+            )
+
+            self.assertEqual(report.summary["output_bytes"], 0)
+            self.assertEqual(report.summary["semantic_blocked_total"], 1)
+            self.assertFalse((out / "semantic" / "profile.dat.semantic.json").exists())
+
+    def test_all_failures_are_persisted_beyond_report_sample(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "input"
+            source.mkdir()
+            for index in range(55):
+                (source / f"invalid_{index}.gpak").write_bytes(b"bad")
+            out = root / "out"
+
+            report = decompile_path(
+                source,
+                out,
+                ExtractionOptions(mode="manifest_only", unity_object_scan=False),
+            )
+
+            self.assertEqual(report.summary["failed_total"], 55)
+            self.assertEqual(len(report.failed_sample), 50)
+            self.assertEqual(len(list(read_manifest(out).iter_failures())), 55)
+
+    def test_scan_continues_after_malformed_container(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "broken.gpak").write_bytes(b"bad")
+            valid = root / "valid.png"
+            valid.write_bytes(PNG_BYTES)
+
+            report = scan_path(root, ScanOptions(unity_object_scan=False))
+
+            self.assertEqual([Path(item.path).name for item in report.files], ["valid.png"])
+            self.assertTrue(any("broken.gpak" in warning for warning in report.warnings))
+
+    def test_file_size_limit_applies_before_container_or_unity_parsing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            oversized = root / "oversized.gpak"
+            with oversized.open("wb") as handle:
+                handle.seek(2 * 1024 * 1024)
+                handle.write(b"bad")
+            valid = root / "valid.png"
+            valid.write_bytes(PNG_BYTES)
+
+            scanned = scan_path(root, ScanOptions(max_file_size_mb=1, unity_object_scan=False))
+            by_name = {Path(item.path).name: item for item in scanned.files}
+            out = root / "out"
+            decompiled = decompile_path(
+                root,
+                out,
+                ExtractionOptions(mode="full", max_file_size_mb=1, unity_object_scan=False),
+            )
+
+            self.assertEqual(by_name["oversized.gpak"].status, "skipped_size_limit")
+            self.assertEqual(by_name["valid.png"].identified_type, "png")
+            self.assertTrue(any(item.get("reason") == "blocked_file_size_limit" for item in decompiled.skipped_sample))
+
+    def test_directory_classification_works_for_absolute_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_dir = Path(tmp) / "audio"
+            audio_dir.mkdir()
+            sample = audio_dir / "bank_without_extension"
+            sample.write_bytes(b"unknown")
+
+            report = probe_file(sample, ScanOptions(embedded_scan=False))
+
+            self.assertEqual(report.category, "audio")
+
+    def test_unused_container_keyring_is_reported_instead_of_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sample = Path(tmp) / "asset.png"
+            sample.write_bytes(PNG_BYTES)
+
+            report = scan_path(
+                sample,
+                ScanOptions(container_keyring_path=str(Path(tmp) / "keys.json"), unity_object_scan=False),
+            )
+
+            self.assertTrue(any("no registered container handler accepts" in warning for warning in report.warnings))
+
+    def test_plugin_container_can_accept_keyring_configuration(self) -> None:
+        class ConfigurableContainer:
+            type_name = "configured"
+
+            def __init__(self):
+                self.keyring = ""
+
+            def configure(self, options):
+                self.keyring = options.container_keyring_path or ""
+                return True
+
+            def sniff(self, _path):
+                return False
+
+            def open(self, _path):
+                raise AssertionError("not opened")
+
+            def extract_entry(self, *_args, **_kwargs):
+                raise AssertionError("not extracted")
+
+        registry = build_capability_registry(load_plugins=False)
+        handler = ConfigurableContainer()
+        registry.add_container_handler(handler, capability_id="test:container:configured", priority=100)
+
+        registry.configure(ScanOptions(container_keyring_path="keys.json"))
+
+        self.assertEqual(handler.keyring, "keys.json")
+        self.assertFalse(any("no registered container handler accepts" in error for error in registry.load_errors))
+
+    def test_detector_priority_and_conflicts_are_explicit(self) -> None:
+        class MarkerDetector:
+            extension = ".mark"
+
+            def __init__(self, type_name: str):
+                self.type_name = type_name
+
+            def identify(self, data: bytes, path: Path):
+                return FileIdentification(str(path), self.type_name, 1.0, path.suffix, data[:4].hex())
+
+            def find_embedded(self, data: bytes, source_file: str):
+                return []
+
+            def validate(self, data: bytes):
+                return True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sample = Path(tmp) / "sample.mark"
+            sample.write_bytes(b"MARK")
+            registry = build_capability_registry(load_plugins=False)
+            low = MarkerDetector("low_priority")
+            high = MarkerDetector("high_priority")
+            registry.add_detector(low, capability_id="test:marker:low", priority=10)
+            registry.add_detector(high, capability_id="test:marker:high", priority=20)
+
+            self.assertEqual(probe_file(sample, registry=registry).identified_type, "high_priority")
+            with self.assertRaisesRegex(ValueError, "duplicate detector capability"):
+                registry.add_detector(MarkerDetector("duplicate"), capability_id="test:marker:high")
+            registry.add_detector(
+                MarkerDetector("replacement"),
+                capability_id="test:marker:high",
+                priority=30,
+                replace=True,
+            )
+            self.assertEqual(probe_file(sample, registry=registry).identified_type, "replacement")
+
+    def test_plugin_streaming_detector_handles_large_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sample = Path(tmp) / "large.bin"
+            sample.write_bytes(b"x" * 64 + b"CSTMdata" + b"x" * 64)
+            registry = build_capability_registry(load_plugins=False)
+
+            def broken_length(_source, _offset, _signature):
+                raise RuntimeError("broken stream")
+
+            registry.add_streaming_detector(
+                type_name="broken_stream",
+                signatures=(b"CSTM",),
+                length_reader=broken_length,
+                extension=".broken",
+                capability_id="test:streaming:broken",
+                priority=200,
+            )
+            registry.add_streaming_detector(
+                type_name="custom_stream",
+                signatures=(b"CSTM",),
+                length_reader=lambda _source, _offset, _signature: 8,
+                extension=".cstm",
+                capability_id="test:streaming:custom",
+                priority=100,
+            )
+
+            report = probe_file(
+                sample,
+                ScanOptions(max_in_memory_bytes=16, stream_chunk_size=17),
+                registry,
+            )
+
+            custom = [item for item in report.embedded_candidates if item.detected_type == "custom_stream"]
+            self.assertEqual(len(custom), 1)
+            self.assertEqual((custom[0].offset, custom[0].length), (64, 8))
+            self.assertTrue(any("broken stream" in error for error in registry.runtime_errors))
+            out = Path(tmp) / "out"
+            with patch("deinserter.pipeline.build_capability_registry", return_value=registry):
+                decompile_path(
+                    sample,
+                    out,
+                    ExtractionOptions(
+                        mode="full",
+                        max_in_memory_bytes=16,
+                        stream_chunk_size=17,
+                        preserve_paths=False,
+                        unity_object_scan=False,
+                    ),
+                )
+            self.assertTrue((out / "custom_stream_00000040.cstm").exists())
+
+    def test_large_probe_skips_non_stream_safe_path_parsers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sample = Path(tmp) / "large.slow"
+            sample.write_bytes(b"slow" * 64)
+            registry = build_capability_registry(load_plugins=False)
+            spec = FormatSpec("slow", (".slow",), "data", "slow_data", "medium", False)
+            registry.add_format(spec)
+            registry.add_detector(ExtensionDetector(spec), capability_id="test:detector:slow", priority=100)
+
+            def unsafe_parser(_path):
+                raise AssertionError("must not materialize")
+
+            registry.add_parser(
+                unsafe_parser,
+                name="slow_path_parser",
+                capability_id="test:parser:slow",
+                extensions={".slow"},
+                priority=100,
+                stream_safe=False,
+            )
+
+            report = probe_file(sample, ScanOptions(max_in_memory_bytes=16), registry)
+
+            self.assertEqual(report.parse_info["parser"], "extension_descriptor")
+
+    def test_source_parser_and_converter_process_container_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive_path = root / "dialogue.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("story.dialogue", b"hello from archive")
+            out = root / "out"
+            registry = build_capability_registry(load_plugins=False)
+            spec = FormatSpec("dialogue", (".dialogue",), "data", "dialogue_text", "high", True)
+            registry.add_format(spec)
+            registry.add_detector(
+                ExtensionDetector(spec),
+                capability_id="test:detector:dialogue",
+                priority=100,
+            )
+            registry.add_source_parser(
+                lambda source, _path: {
+                    "parser": "dialogue_source",
+                    "status": "parsed",
+                    "text": source.read_all().decode("utf-8"),
+                },
+                name="dialogue_source",
+                capability_id="test:parser:dialogue",
+                extensions={".dialogue"},
+                priority=100,
+            )
+            registry.add_converter(
+                lambda context: {
+                    "status": "plugin_converted",
+                    "preview": context.source.read_at(0, 5).decode("ascii"),
+                },
+                name="dialogue_converter",
+                capability_id="test:converter:dialogue",
+                extensions={".dialogue"},
+                priority=100,
+            )
+
+            with patch("deinserter.pipeline.build_capability_registry", return_value=registry):
+                decompile_path(
+                    archive_path,
+                    out,
+                    ExtractionOptions(mode="manifest_only", unity_object_scan=False),
+                )
+
+            events = list(read_manifest(out).iter_capability_events())
+            artifact = next(item for item in events if item.get("stream") == "container_artifact")
+            converted = next(item for item in events if item.get("capability_id") == "test:converter:dialogue")
+            self.assertEqual(artifact["parse_info"]["parser"], "dialogue_source")
+            self.assertEqual(artifact["parse_info"]["text"], "hello from archive")
+            self.assertEqual(converted["preview"], "hello")
+
+    def test_nested_containers_are_processed_with_depth_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inner_bytes = io.BytesIO()
+            with zipfile.ZipFile(inner_bytes, "w") as inner:
+                inner.writestr("notes.txt", "nested")
+            outer_path = root / "outer.zip"
+            with zipfile.ZipFile(outer_path, "w") as outer:
+                outer.writestr("inner.zip", inner_bytes.getvalue())
+
+            recursive_out = root / "recursive"
+            recursive = decompile_path(
+                outer_path,
+                recursive_out,
+                ExtractionOptions(mode="manifest_only", unity_object_scan=False, max_container_depth=4),
+            )
+            shallow_out = root / "shallow"
+            shallow = decompile_path(
+                outer_path,
+                shallow_out,
+                ExtractionOptions(mode="manifest_only", unity_object_scan=False, max_container_depth=0),
+            )
+
+            self.assertEqual(recursive.summary["containers_total"], 2)
+            self.assertEqual(recursive.summary["container_entries_total"], 2)
+            self.assertEqual(shallow.summary["containers_total"], 1)
+            nested_events = [
+                item
+                for item in read_manifest(recursive_out).iter_capability_events()
+                if item.get("stream") == "nested_container"
+            ]
+            self.assertEqual(len(nested_events), 1)
+
+    def test_container_entry_limit_is_global_and_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive_path = root / "many.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                for index in range(3):
+                    archive.writestr(f"item_{index}.txt", "value")
+
+            report = decompile_path(
+                archive_path,
+                root / "out",
+                ExtractionOptions(
+                    mode="manifest_only",
+                    unity_object_scan=False,
+                    max_container_entries=1,
+                ),
+            )
+
+            self.assertEqual(report.summary["container_entries_total"], 1)
+            self.assertTrue(any("container_entry_limit_reached" in warning for warning in report.warnings))
+
+    def test_plugin_api_version_is_enforced(self) -> None:
+        registry = build_capability_registry(load_plugins=False)
+
+        def incompatible(_registry):
+            return None
+
+        incompatible.DEINSERTER_API_VERSION = CAPABILITY_API_VERSION + 1
+        with self.assertRaisesRegex(ValueError, "unsupported plugin API version"):
+            register_plugin_callable(registry, "incompatible", incompatible)
+
+    def test_entry_point_plugins_can_be_loaded_or_disabled(self) -> None:
+        class FakeEntryPoint:
+            name = "fake_plugin"
+
+            @staticmethod
+            def load():
+                def register(registry):
+                    registry.add_converter(
+                        lambda _context: {"status": "fake"},
+                        name="fake",
+                        capability_id="fake:converter",
+                        extensions={".fake"},
+                    )
+
+                register.DEINSERTER_API_VERSION = CAPABILITY_API_VERSION
+                return register
+
+        with patch("deinserter.registry.entry_points", return_value=[FakeEntryPoint()]):
+            loaded = build_capability_registry()
+            disabled = build_capability_registry(disabled_plugins={"fake_plugin"})
+
+        self.assertIn("fake", [item.name for item in loaded.converters])
+        self.assertNotIn("fake", [item.name for item in disabled.converters])
+        self.assertEqual(disabled.plugins[0]["status"], "disabled")
+
+    def test_entry_point_descriptor_gets_generated_extension_detector(self) -> None:
+        class DescriptorEntryPoint:
+            name = "descriptor_plugin"
+
+            @staticmethod
+            def load():
+                def register(registry):
+                    registry.add_format(FormatSpec("plugdata", (".plug",), "data", "plugin_data", "high", True))
+
+                return register
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sample = Path(tmp) / "sample.plug"
+            sample.write_text("plugin", encoding="utf-8")
+            with patch("deinserter.registry.entry_points", return_value=[DescriptorEntryPoint()]):
+                registry = build_capability_registry()
+
+            self.assertEqual(probe_file(sample, registry=registry).identified_type, "plugdata")
+
+    def test_failed_plugin_registration_is_transactional(self) -> None:
+        registry = build_capability_registry(load_plugins=False)
+
+        def broken(registry):
+            registry.add_converter(
+                lambda _context: None,
+                name="partial",
+                capability_id="broken:partial",
+                extensions={".broken"},
+            )
+            raise RuntimeError("registration failed")
+
+        with self.assertRaisesRegex(RuntimeError, "registration failed"):
+            register_plugin_callable(registry, "broken", broken)
+        self.assertNotIn("broken:partial", [item.capability_id for item in registry.converters])
+
+    def test_plugin_can_explicitly_replace_builtin_capability(self) -> None:
+        registry = build_capability_registry(load_plugins=False)
+
+        def replacement(registry):
+            registry.add_converter(
+                lambda _context: {"status": "replacement"},
+                name="semantic_replacement",
+                capability_id="builtin:converter:semantic",
+                predicate=lambda _path, _type, _category: True,
+                priority=500,
+                replace=True,
+            )
+
+        register_plugin_callable(registry, "replacement", replacement)
+
+        capabilities = [item for item in registry.converters if item.capability_id == "builtin:converter:semantic"]
+        self.assertEqual(len(capabilities), 1)
+        self.assertEqual(capabilities[0].source, "plugin:replacement")
+
+    def test_plugin_run_hook_can_prepare_shared_services(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "sample.txt"
+            sample.write_text("hello", encoding="utf-8")
+            out = root / "out"
+            registry = build_capability_registry(load_plugins=False)
+
+            def prepare(context):
+                context.services["prepared_value"] = 7
+                context.summary["plugin_prepared"] = True
+
+            def consume(context):
+                return {"status": "consumed", "value": context.services["prepared_value"]}
+
+            registry.add_run_hook(prepare, capability_id="test:run_hook:prepare", priority=100)
+            registry.add_converter(
+                consume,
+                capability_id="test:converter:consume",
+                extensions={".txt"},
+                priority=100,
+            )
+
+            with patch("deinserter.pipeline.build_capability_registry", return_value=registry):
+                report = decompile_path(
+                    sample,
+                    out,
+                    ExtractionOptions(mode="manifest_only", unity_object_scan=False),
+                )
+
+            events = list(read_manifest(out).iter_capability_events())
+            self.assertTrue(report.summary["plugin_prepared"])
+            self.assertTrue(any(item.get("value") == 7 for item in events))
+
+    def test_malformed_processor_result_is_isolated_from_later_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "sample.txt"
+            sample.write_text("hello", encoding="utf-8")
+            out = root / "out"
+            registry = build_capability_registry(load_plugins=False)
+            registry.add_converter(
+                lambda _context: "invalid result",
+                name="malformed",
+                capability_id="test:converter:malformed",
+                extensions={".txt"},
+                priority=200,
+            )
+            registry.add_converter(
+                lambda _context: {"status": "later_capability_ran"},
+                name="later",
+                capability_id="test:converter:later",
+                extensions={".txt"},
+                priority=100,
+            )
+
+            with patch("deinserter.pipeline.build_capability_registry", return_value=registry):
+                report = decompile_path(
+                    sample,
+                    out,
+                    ExtractionOptions(mode="manifest_only", unity_object_scan=False),
+                )
+
+            events = list(read_manifest(out).iter_capability_events())
+            self.assertTrue(any(item.get("status") == "later_capability_ran" for item in events))
+            self.assertEqual(report.summary["failed_total"], 1)
+
+    def test_manifest_paths_are_absolute_and_portable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "asset.png"
+            source.write_bytes(PNG_BYTES)
+            out = root / "relative-out"
+
+            report = decompile_path(
+                source,
+                out,
+                ExtractionOptions(mode="manifest_only", unity_object_scan=False),
+            )
+
+            self.assertTrue(Path(report.manifest_paths.summary).is_absolute())
+            self.assertEqual(len(list(read_manifest(out).iter_files())), 1)
+
+    def test_plugin_scaffold_validate_and_sample_test_cover_code_capabilities(self) -> None:
+        from deinserter.cli import _init_plugin, _test_plugin, _validate_plugin
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plugin_dir = root / "deinserter-example"
+            created = _init_plugin(plugin_dir, template="full")
+            sample = root / "sample.dialogue"
+            sample.write_bytes(b"DIALOGUE\0hello")
+
+            validation = _validate_plugin(plugin_dir)
+            tested = _test_plugin(plugin_dir, sample, "example_dialogue")
+
+            self.assertEqual(created["template"], "full")
+            self.assertTrue(validation["valid"], validation)
+            self.assertGreaterEqual(validation["capabilities_added"]["detectors"], 1)
+            self.assertGreaterEqual(validation["capabilities_added"]["converters"], 1)
+            self.assertTrue(tested["matched"], tested)
+
+    def test_plugin_validation_returns_structured_format_errors(self) -> None:
+        from deinserter.cli import _validate_plugin
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_dir = Path(tmp)
+            (plugin_dir / "formats.toml").write_text(
+                '''[[formats]]
+type_name = "Bad Type"
+extensions = [42]
+category = "data"
+role = "bad"
+decompile_value = "unlimited"
+''',
+                encoding="utf-8",
+            )
+
+            validation = _validate_plugin(plugin_dir)
+
+            self.assertFalse(validation["valid"])
+            self.assertTrue(validation["load_errors"])
 
 
 if __name__ == "__main__":

@@ -1122,10 +1122,15 @@ class TextScriptDetector(Detector):
             return False
 
 
-def build_builtin_detectors(format_specs: Iterable[FormatSpec] = SUPPORTED_FORMATS) -> list[Detector]:
+def build_builtin_detectors(
+    format_specs: Iterable[FormatSpec] = SUPPORTED_FORMATS,
+    *,
+    include_extension_detectors: bool = True,
+    include_text_detector: bool = True,
+) -> list[Detector]:
     specs = tuple(format_specs)
     text_extensions = frozenset(extension for spec in specs if spec.text for extension in spec.extensions)
-    return [
+    detectors: list[Detector] = [
         PngDetector(),
         GlbDetector(),
         WavDetector(),
@@ -1147,9 +1152,12 @@ def build_builtin_detectors(format_specs: Iterable[FormatSpec] = SUPPORTED_FORMA
         UnrealPackageDetector(),
         RpfDetector(),
         KtxDetector(),
-        *(ExtensionDetector(spec) for spec in specs),
-        TextScriptDetector(text_extensions),
     ]
+    if include_extension_detectors:
+        detectors.extend(ExtensionDetector(spec) for spec in specs)
+    if include_text_detector:
+        detectors.append(TextScriptDetector(text_extensions))
+    return detectors
 
 
 DETECTORS: list[Detector] = build_builtin_detectors(SUPPORTED_FORMATS)
